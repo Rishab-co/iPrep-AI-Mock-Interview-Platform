@@ -1,0 +1,3419 @@
+﻿================================================
+FILE: maven-wrapper.properties
+================================================
+wrapperVersion=3.3.4
+distributionType=only-script
+distributionUrl=https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/3.9.14/apache-maven-3.9.14-bin.zip
+
+
+
+================================================
+FILE: SecurityConfig.java
+================================================
+package com.iprep.config;
+
+import com.iprep.security.JwtAuthFilter;
+import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.authentication.AuthenticationManager;
+import org.springframework.security.authentication.AuthenticationProvider;
+import org.springframework.security.authentication.dao.DaoAuthenticationProvider;
+import org.springframework.security.config.annotation.authentication.configuration.AuthenticationConfiguration;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.core.userdetails.UserDetailsService;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+import org.springframework.web.cors.CorsConfiguration;
+import org.springframework.web.cors.CorsConfigurationSource;
+import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
+
+import java.util.Arrays;
+import java.util.List;
+
+@Configuration
+@EnableWebSecurity
+@RequiredArgsConstructor
+public class SecurityConfig {
+
+    private final JwtAuthFilter jwtAuthFilter;
+    private final UserDetailsService userDetailsService;
+
+    @Value("${app.cors.allowed-origins}")
+    private String allowedOrigins;
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+            .cors(c -> c.configurationSource(corsConfigurationSource()))
+            .csrf(c -> c.disable())
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/api/v1/auth/**", "/actuator/health").permitAll()
+                .anyRequest().authenticated()
+            )
+            .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+            .authenticationProvider(authenticationProvider())
+            .addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter.class);
+        return http.build();
+    }
+
+    @Bean
+    public CorsConfigurationSource corsConfigurationSource() {
+        CorsConfiguration config = new CorsConfiguration();
+        config.setAllowedOrigins(Arrays.asList(allowedOrigins.split(",")));
+        config.setAllowedMethods(List.of("GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"));
+        config.setAllowedHeaders(List.of("*"));
+        config.setAllowCredentials(true);
+        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+        source.registerCorsConfiguration("/**", config);
+        return source;
+    }
+
+    @Bean
+    public AuthenticationProvider authenticationProvider() {
+        DaoAuthenticationProvider p = new DaoAuthenticationProvider();
+        p.setUserDetailsService(userDetailsService);
+        p.setPasswordEncoder(passwordEncoder());
+        return p;
+    }
+
+    @Bean
+    public AuthenticationManager authenticationManager(AuthenticationConfiguration config) throws Exception {
+        return config.getAuthenticationManager();
+    }
+
+    @Bean
+    public PasswordEncoder passwordEncoder() {
+        return new BCryptPasswordEncoder(12);
+    }
+}
+
+
+
+================================================
+FILE: AuthController.java
+================================================
+package com.iprep.controller;
+
+import com.iprep.dto.AuthRequest;
+import com.iprep.dto.AuthResponse;
+import com.iprep.dto.RegisterRequest;
+import com.iprep.service.AuthService;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/v1/auth")
+@RequiredArgsConstructor
+public class AuthController {
+
+    private final AuthService authService;
+
+    @PostMapping("/register")
+    public ResponseEntity<AuthResponse> register(@Valid @RequestBody RegisterRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED).body(authService.register(request));
+    }
+
+    @PostMapping("/login")
+    public ResponseEntity<AuthResponse> login(@Valid @RequestBody AuthRequest request) {
+        return ResponseEntity.ok(authService.login(request));
+    }
+}
+
+
+
+================================================
+FILE: InterviewController.java
+================================================
+package com.iprep.controller;
+
+import com.iprep.dto.*;
+import com.iprep.entity.User;
+import com.iprep.service.InterviewService;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
+
+import java.util.List;
+import java.util.UUID;
+
+/**
+ * REST Controller â€” Interview Lifecycle
+ *
+ *  POST  /api/v1/interviews                       â†’ Start interview
+ *  POST  /api/v1/interviews/{id}/respond          â†’ Submit text response
+ *  POST  /api/v1/interviews/{id}/transcribe       â†’ Upload audio â†’ Whisper STT
+ *  POST  /api/v1/interviews/{id}/end              â†’ End + evaluate
+ *  GET   /api/v1/interviews                       â†’ List user interviews
+ *  GET   /api/v1/interviews/{id}                  â†’ Interview detail + transcript
+ */
+@Slf4j
+@RestController
+@RequestMapping("/api/v1/interviews")
+@RequiredArgsConstructor
+public class InterviewController {
+
+    private final InterviewService interviewService;
+
+    // â”€â”€ Start â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    @PostMapping
+    public ResponseEntity<StartInterviewResponse> startInterview(
+            @AuthenticationPrincipal User user,
+            @Valid @RequestBody StartInterviewRequest request) {
+
+        log.info("User {} starting interview for: {}", user.getEmail(), request.getTargetRole());
+        return ResponseEntity.status(HttpStatus.CREATED)
+            .body(interviewService.startInterview(request, user.getEmail()));
+    }
+
+    // â”€â”€ Respond (text) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    @PostMapping("/{interviewId}/respond")
+    public ResponseEntity<RespondResponse> respond(
+            @AuthenticationPrincipal User user,
+            @PathVariable UUID interviewId,
+            @Valid @RequestBody RespondRequest request) {
+
+        return ResponseEntity.ok(
+            interviewService.processUserResponse(interviewId, request.getContent(), user.getEmail()));
+    }
+
+    // â”€â”€ Transcribe audio (Whisper) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    @PostMapping("/{interviewId}/transcribe")
+    public ResponseEntity<TranscribeResponse> transcribe(
+            @AuthenticationPrincipal User user,
+            @PathVariable UUID interviewId,
+            @RequestParam("audio") MultipartFile audioFile) {
+
+        log.info("Transcribing audio for interview {} â€” {} bytes",
+                 interviewId, audioFile.getSize());
+        try {
+            byte[] bytes = audioFile.getBytes();
+            String mimeType = audioFile.getContentType() != null
+                ? audioFile.getContentType() : "audio/webm";
+            String text = interviewService.transcribeAudio(interviewId, user.getEmail(), bytes, mimeType);
+            return ResponseEntity.ok(new TranscribeResponse(text));
+        } catch (Exception e) {
+            log.error("Transcription failed", e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
+        }
+    }
+
+    // â”€â”€ End + Evaluate â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    @PostMapping("/{interviewId}/end")
+    public ResponseEntity<EvaluationResult> endInterview(
+            @AuthenticationPrincipal User user,
+            @PathVariable UUID interviewId) {
+
+        return ResponseEntity.ok(interviewService.endInterview(interviewId, user.getEmail()));
+    }
+
+    // â”€â”€ List â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    @GetMapping
+    public ResponseEntity<List<InterviewSummaryDTO>> listInterviews(
+            @AuthenticationPrincipal User user) {
+
+        return ResponseEntity.ok(interviewService.getInterviewSummaries(user.getEmail()));
+    }
+
+    // â”€â”€ Detail â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    @GetMapping("/{interviewId}")
+    public ResponseEntity<InterviewDetailDTO> getInterview(
+            @AuthenticationPrincipal User user,
+            @PathVariable UUID interviewId) {
+
+        return ResponseEntity.ok(interviewService.getInterviewDetail(interviewId, user.getEmail()));
+    }
+}
+
+
+
+================================================
+FILE: AuthRequest.java
+================================================
+package com.iprep.dto;
+import jakarta.validation.constraints.*;
+import lombok.Data;
+@Data
+public class AuthRequest {
+    @Email @NotBlank private String email;
+    @NotBlank @Size(min = 6) private String password;
+}
+
+
+
+================================================
+FILE: AuthResponse.java
+================================================
+package com.iprep.dto;
+import lombok.Builder;
+import lombok.Data;
+@Data @Builder
+public class AuthResponse {
+    private String accessToken;
+    private String email;
+    private String fullName;
+}
+
+
+
+================================================
+FILE: EvaluationResult.java
+================================================
+package com.iprep.dto;
+
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import lombok.*;
+import java.util.List;
+
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+@JsonIgnoreProperties(ignoreUnknown = true)
+public class EvaluationResult {
+    private double technicalScore;
+    private double communicationScore;
+    private double problemSolvingScore;
+    private double depthScore;
+    private double overallScore;
+    private String verdict;             // READY_FOR_PLACEMENT | BORDERLINE | NEEDS_MORE_PRACTICE
+    private String verdictTitle;
+    private String verdictDescription;
+    private List<String> strengths;
+    private List<String> areasForImprovement;
+    private List<QuestionScore> questionScores;
+    private String correctnessAnalysis;
+    private List<String> recommendedTopics;
+
+    @Data
+    @Builder
+    @NoArgsConstructor
+    @AllArgsConstructor
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class QuestionScore {
+        private int questionNumber;
+        private int score;
+        private String feedback;
+    }
+}
+
+
+
+================================================
+FILE: InterviewDetailDTO.java
+================================================
+package com.iprep.dto;
+
+import lombok.Builder;
+import lombok.Data;
+import java.util.List;
+import java.util.UUID;
+
+@Data @Builder
+public class InterviewDetailDTO {
+    private UUID id;
+    private String targetRole;
+    private String status;
+    private List<InterviewMessage> transcript;
+    private EvaluationResult evaluation;
+}
+
+
+
+================================================
+FILE: InterviewMessage.java
+================================================
+package com.iprep.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data @Builder @AllArgsConstructor @NoArgsConstructor
+public class InterviewMessage {
+    private String speaker;   // "USER" | "AI"
+    private String content;
+    private int sequenceNumber;
+}
+
+
+
+================================================
+FILE: InterviewSummaryDTO.java
+================================================
+package com.iprep.dto;
+
+import lombok.Builder;
+import lombok.Data;
+import java.time.Instant;
+import java.util.UUID;
+
+@Data @Builder
+public class InterviewSummaryDTO {
+    private UUID id;
+    private String targetRole;
+    private String experienceLevel;
+    private String difficulty;
+    private String status;
+    private Double overallScore;
+    private String verdict;
+    private Instant startedAt;
+    private Integer durationSeconds;
+}
+
+
+
+================================================
+FILE: RegisterRequest.java
+================================================
+package com.iprep.dto;
+import jakarta.validation.constraints.*;
+import lombok.Data;
+@Data
+public class RegisterRequest {
+    @NotBlank private String fullName;
+    @Email @NotBlank private String email;
+    @NotBlank @Size(min = 8) private String password;
+}
+
+
+
+================================================
+FILE: RespondRequest.java
+================================================
+package com.iprep.dto;
+
+import jakarta.validation.constraints.NotBlank;
+import lombok.Data;
+
+@Data
+public class RespondRequest {
+    @NotBlank
+    private String content;
+}
+
+
+
+================================================
+FILE: RespondResponse.java
+================================================
+package com.iprep.dto;
+
+import lombok.Builder;
+import lombok.Data;
+
+@Data @Builder
+public class RespondResponse {
+    private String aiMessage;
+    private String audioBase64;
+    private String mimeType;
+    private boolean isLastQuestion;
+    private int questionNumber;
+}
+
+
+
+================================================
+FILE: StartInterviewRequest.java
+================================================
+package com.iprep.dto;
+
+import jakarta.validation.constraints.*;
+import lombok.Data;
+
+@Data
+public class StartInterviewRequest {
+    @NotBlank
+    private String targetRole;
+
+    @NotBlank
+    private String experienceLevel;  // FRESHER | MID | SENIOR
+
+    @NotBlank
+    @Pattern(regexp = "EASY|MEDIUM|HARD")
+    private String difficulty;
+
+    @Min(3) @Max(10)
+    private int questionCount = 5;
+}
+
+
+
+================================================
+FILE: StartInterviewResponse.java
+================================================
+package com.iprep.dto;
+
+import lombok.Builder;
+import lombok.Data;
+import java.util.UUID;
+
+@Data @Builder
+public class StartInterviewResponse {
+    private UUID interviewId;
+    private String aiMessage;
+    private String audioBase64;   // Base64-encoded MP3 â€” frontend plays this directly
+    private String mimeType;      // "audio/mpeg"
+}
+
+
+
+================================================
+FILE: TranscribeResponse.java
+================================================
+package com.iprep.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+
+@Data @AllArgsConstructor
+public class TranscribeResponse {
+    private String transcript;
+}
+
+
+
+================================================
+FILE: Interview.java
+================================================
+package com.iprep.entity;
+import jakarta.persistence.*;
+import lombok.*;
+import java.time.Instant;
+import java.util.UUID;
+@Entity @Table(name = "interviews")
+@Data @Builder @NoArgsConstructor @AllArgsConstructor
+public class Interview {
+    @Id @GeneratedValue(strategy = GenerationType.UUID) private UUID id;
+    @ManyToOne(fetch = FetchType.LAZY) @JoinColumn(name = "user_id", nullable = false) private User user;
+    @Column(nullable = false) private String targetRole;
+    @Column(nullable = false) private String experienceLevel;
+    @Column(nullable = false) private String difficulty;
+    @Builder.Default private String status = "IN_PROGRESS";
+    private int questionCount;
+    @Column(columnDefinition = "TEXT") private String systemPrompt;
+    @Column(nullable = false) private Instant startedAt;
+    private Instant completedAt;
+    private Integer durationSeconds;
+    private Double technicalScore;
+    private Double communicationScore;
+    private Double problemSolvingScore;
+    private Double depthScore;
+    private Double overallScore;
+    private String verdict;
+}
+
+
+
+================================================
+FILE: TranscriptMessage.java
+================================================
+package com.iprep.entity;
+import jakarta.persistence.*;
+import lombok.*;
+import java.time.Instant;
+import java.util.UUID;
+@Entity @Table(name = "transcript_messages")
+@Data @Builder @NoArgsConstructor @AllArgsConstructor
+public class TranscriptMessage {
+    @Id @GeneratedValue(strategy = GenerationType.UUID) private UUID id;
+    @ManyToOne(fetch = FetchType.LAZY) @JoinColumn(name = "interview_id", nullable = false) private Interview interview;
+    @Column(nullable = false) private int sequenceNumber;
+    @Column(nullable = false) private String speaker;
+    @Column(nullable = false, columnDefinition = "TEXT") private String content;
+    private Instant createdAt;
+    @PrePersist public void prePersist() { if (createdAt == null) createdAt = Instant.now(); }
+}
+
+
+
+================================================
+FILE: User.java
+================================================
+package com.iprep.entity;
+
+import jakarta.persistence.*;
+import lombok.*;
+import org.springframework.security.core.GrantedAuthority;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.userdetails.UserDetails;
+
+import java.time.Instant;
+import java.util.Collection;
+import java.util.List;
+import java.util.UUID;
+
+@Entity
+@Table(name = "users")
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class User implements UserDetails {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.UUID)
+    private UUID id;
+
+    @Column(nullable = false, unique = true)
+    private String email;
+
+    @Column(nullable = false)
+    private String password;
+
+    @Column(nullable = false, name = "full_name")
+    private String fullName;
+
+    @Builder.Default
+    private String role = "USER";
+
+    @Column(name = "created_at")
+    private Instant createdAt;
+
+    @Builder.Default
+    private boolean active = true;
+
+    @PrePersist
+    public void prePersist() {
+        if (createdAt == null) createdAt = Instant.now();
+    }
+
+    // â”€â”€ UserDetails â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    @Override public Collection<? extends GrantedAuthority> getAuthorities() {
+        return List.of(new SimpleGrantedAuthority("ROLE_" + role));
+    }
+    @Override public String getPassword()                { return password; }
+    @Override public String getUsername()                { return email; }
+    @Override public boolean isAccountNonExpired()       { return true; }
+    @Override public boolean isAccountNonLocked()        { return true; }
+    @Override public boolean isCredentialsNonExpired()   { return true; }
+    @Override public boolean isEnabled()                 { return active; }
+}
+
+
+
+================================================
+FILE: GlobalExceptionHandler.java
+================================================
+package com.iprep.exception;
+
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.authentication.BadCredentialsException;
+import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+
+import java.util.HashMap;
+import java.util.Map;
+
+@Slf4j
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public ResponseEntity<Map<String, String>> handleValidation(MethodArgumentNotValidException ex) {
+        Map<String, String> errors = new HashMap<>();
+        ex.getBindingResult().getFieldErrors()
+          .forEach(e -> errors.put(e.getField(), e.getDefaultMessage()));
+        return ResponseEntity.badRequest().body(errors);
+    }
+
+    @ExceptionHandler(BadCredentialsException.class)
+    public ResponseEntity<Map<String, String>> handleBadCredentials(BadCredentialsException ex) {
+        return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+               .body(Map.of("error", "Invalid email or password"));
+    }
+
+    @ExceptionHandler(IllegalArgumentException.class)
+    public ResponseEntity<Map<String, String>> handleIllegalArg(IllegalArgumentException ex) {
+        return ResponseEntity.badRequest().body(Map.of("error", ex.getMessage()));
+    }
+
+    @ExceptionHandler(IllegalStateException.class)
+    public ResponseEntity<Map<String, String>> handleIllegalState(IllegalStateException ex) {
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(Map.of("error", ex.getMessage()));
+    }
+
+    @ExceptionHandler(OpenAIException.class)
+    public ResponseEntity<Map<String, String>> handleOpenAI(OpenAIException ex) {
+        log.error("OpenAI error: {}", ex.getMessage());
+        return ResponseEntity.status(HttpStatus.BAD_GATEWAY)
+               .body(Map.of("error", "AI service error: " + ex.getMessage()));
+    }
+
+    @ExceptionHandler(RuntimeException.class)
+    public ResponseEntity<Map<String, String>> handleRuntime(RuntimeException ex) {
+        log.error("Unexpected error: {}", ex.getMessage(), ex);
+        if (ex.getMessage() != null && ex.getMessage().contains("not found")) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", ex.getMessage()));
+        }
+        if (ex.getMessage() != null && ex.getMessage().contains("Access denied")) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of("error", ex.getMessage()));
+        }
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+               .body(Map.of("error", "Internal server error"));
+    }
+}
+
+
+
+================================================
+FILE: OpenAIException.java
+================================================
+package com.iprep.exception;
+public class OpenAIException extends RuntimeException {
+    public OpenAIException(String message) { super(message); }
+}
+
+
+
+================================================
+FILE: InterviewRepository.java
+================================================
+package com.iprep.repository;
+import com.iprep.entity.Interview;
+import com.iprep.entity.User;
+import org.springframework.data.jpa.repository.JpaRepository;
+import java.util.List;
+import java.util.UUID;
+public interface InterviewRepository extends JpaRepository<Interview, UUID> {
+    List<Interview> findByUserOrderByStartedAtDesc(User user);
+}
+
+
+
+================================================
+FILE: TranscriptMessageRepository.java
+================================================
+package com.iprep.repository;
+import com.iprep.entity.Interview;
+import com.iprep.entity.TranscriptMessage;
+import org.springframework.data.jpa.repository.JpaRepository;
+import java.util.List;
+import java.util.UUID;
+public interface TranscriptMessageRepository extends JpaRepository<TranscriptMessage, UUID> {
+    List<TranscriptMessage> findByInterviewOrderBySequenceNumber(Interview interview);
+    int countByInterview(Interview interview);
+}
+
+
+
+================================================
+FILE: UserRepository.java
+================================================
+package com.iprep.repository;
+import com.iprep.entity.User;
+import org.springframework.data.jpa.repository.JpaRepository;
+import java.util.Optional;
+import java.util.UUID;
+public interface UserRepository extends JpaRepository<User, UUID> {
+    Optional<User> findByEmail(String email);
+    boolean existsByEmail(String email);
+}
+
+
+
+================================================
+FILE: JwtAuthFilter.java
+================================================
+package com.iprep.security;
+
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import lombok.RequiredArgsConstructor;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.security.core.userdetails.UserDetails;
+import org.springframework.security.core.userdetails.UserDetailsService;
+import org.springframework.security.web.authentication.WebAuthenticationDetailsSource;
+import org.springframework.stereotype.Component;
+import org.springframework.web.filter.OncePerRequestFilter;
+import java.io.IOException;
+
+@Component
+@RequiredArgsConstructor
+public class JwtAuthFilter extends OncePerRequestFilter {
+
+    private final JwtService jwtService;
+    private final UserDetailsService userDetailsService;
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request,
+                                    HttpServletResponse response,
+                                    FilterChain filterChain)
+            throws ServletException, IOException {
+
+        String authHeader = request.getHeader("Authorization");
+        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+            filterChain.doFilter(request, response);
+            return;
+        }
+
+        String token = authHeader.substring(7);
+        String username = jwtService.extractUsername(token);
+
+        if (username != null && SecurityContextHolder.getContext().getAuthentication() == null) {
+            UserDetails userDetails = userDetailsService.loadUserByUsername(username);
+            if (jwtService.isTokenValid(token, userDetails)) {
+                var authToken = new UsernamePasswordAuthenticationToken(
+                        userDetails, null, userDetails.getAuthorities());
+                authToken.setDetails(new WebAuthenticationDetailsSource().buildDetails(request));
+                SecurityContextHolder.getContext().setAuthentication(authToken);
+            }
+        }
+        filterChain.doFilter(request, response);
+    }
+}
+
+
+
+================================================
+FILE: JwtService.java
+================================================
+package com.iprep.security;
+
+import io.jsonwebtoken.*;
+import io.jsonwebtoken.security.Keys;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.security.core.userdetails.UserDetails;
+import org.springframework.stereotype.Service;
+import javax.crypto.SecretKey;
+import java.nio.charset.StandardCharsets;
+import java.util.Date;
+
+@Service
+public class JwtService {
+
+    @Value("${jwt.secret}")
+    private String secret;
+
+    @Value("${jwt.access-token-expiry-ms}")
+    private long accessExpiry;
+
+    public String generateToken(UserDetails userDetails) {
+        return Jwts.builder()
+                .subject(userDetails.getUsername())
+                .issuedAt(new Date())
+                .expiration(new Date(System.currentTimeMillis() + accessExpiry))
+                .signWith(getKey())
+                .compact();
+    }
+
+    public String extractUsername(String token) {
+        return Jwts.parser().verifyWith(getKey()).build()
+                .parseSignedClaims(token).getPayload().getSubject();
+    }
+
+    public boolean isTokenValid(String token, UserDetails userDetails) {
+        try {
+            String username = extractUsername(token);
+            return username.equals(userDetails.getUsername())
+                    && !isTokenExpired(token);
+        } catch (JwtException e) {
+            return false;
+        }
+    }
+
+    private boolean isTokenExpired(String token) {
+        return Jwts.parser().verifyWith(getKey()).build()
+                .parseSignedClaims(token).getPayload()
+                .getExpiration().before(new Date());
+    }
+
+    private SecretKey getKey() {
+        return Keys.hmacShaKeyFor(secret.getBytes(StandardCharsets.UTF_8));
+    }
+}
+
+
+
+================================================
+FILE: UserDetailsServiceImpl.java
+================================================
+package com.iprep.security;
+
+import com.iprep.repository.UserRepository;
+import lombok.RequiredArgsConstructor;
+import org.springframework.security.core.userdetails.*;
+import org.springframework.stereotype.Service;
+
+@Service
+@RequiredArgsConstructor
+public class UserDetailsServiceImpl implements UserDetailsService {
+
+    private final UserRepository userRepository;
+
+    @Override
+    public UserDetails loadUserByUsername(String email) throws UsernameNotFoundException {
+        return userRepository.findByEmail(email)
+            .orElseThrow(() -> new UsernameNotFoundException("User not found: " + email));
+    }
+}
+
+
+
+================================================
+FILE: AuthService.java
+================================================
+package com.iprep.service;
+
+import com.iprep.dto.AuthRequest;
+import com.iprep.dto.AuthResponse;
+import com.iprep.dto.RegisterRequest;
+import com.iprep.entity.User;
+import com.iprep.repository.UserRepository;
+import com.iprep.security.JwtService;
+import lombok.RequiredArgsConstructor;
+import org.springframework.security.authentication.AuthenticationManager;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.userdetails.UserDetailsService;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.stereotype.Service;
+
+@Service
+@RequiredArgsConstructor
+public class AuthService {
+
+    private final UserRepository userRepository;
+    private final PasswordEncoder passwordEncoder;
+    private final JwtService jwtService;
+    private final AuthenticationManager authManager;
+    private final UserDetailsService userDetailsService;
+
+    public AuthResponse register(RegisterRequest request) {
+        if (userRepository.existsByEmail(request.getEmail()))
+            throw new IllegalArgumentException("Email already registered");
+
+        User user = User.builder()
+                .email(request.getEmail())
+                .password(passwordEncoder.encode(request.getPassword()))
+                .fullName(request.getFullName())
+                .build();
+        userRepository.save(user);
+
+        var ud = userDetailsService.loadUserByUsername(user.getEmail());
+        return AuthResponse.builder()
+                .accessToken(jwtService.generateToken(ud))
+                .email(user.getEmail())
+                .fullName(user.getFullName())
+                .build();
+    }
+
+    public AuthResponse login(AuthRequest request) {
+        authManager.authenticate(
+            new UsernamePasswordAuthenticationToken(request.getEmail(), request.getPassword()));
+        var ud = userDetailsService.loadUserByUsername(request.getEmail());
+        User user = userRepository.findByEmail(request.getEmail()).orElseThrow();
+        return AuthResponse.builder()
+                .accessToken(jwtService.generateToken(ud))
+                .email(user.getEmail())
+                .fullName(user.getFullName())
+                .build();
+    }
+}
+
+
+
+================================================
+FILE: InterviewService.java
+================================================
+package com.iprep.service;
+
+import com.iprep.dto.*;
+import com.iprep.entity.Interview;
+import com.iprep.entity.TranscriptMessage;
+import com.iprep.entity.User;
+import com.iprep.repository.InterviewRepository;
+import com.iprep.repository.TranscriptMessageRepository;
+import com.iprep.repository.UserRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.Instant;
+import java.util.*;
+import java.util.stream.Collectors;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class InterviewService {
+
+    private final OpenAIService openAIService;
+    private final InterviewRepository interviewRepository;
+    private final TranscriptMessageRepository transcriptRepo;
+    private final UserRepository userRepository;
+
+    // â”€â”€ Start â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    @Transactional
+    public StartInterviewResponse startInterview(StartInterviewRequest request, String userEmail) {
+        User user = userRepository.findByEmail(userEmail)
+                .orElseThrow(() -> new RuntimeException("User not found"));
+
+        Interview interview = Interview.builder()
+                .user(user)
+                .targetRole(request.getTargetRole())
+                .experienceLevel(request.getExperienceLevel())
+                .difficulty(request.getDifficulty())
+                .questionCount(request.getQuestionCount())
+                .status("IN_PROGRESS")
+                .systemPrompt(openAIService.buildSystemPrompt(
+                        request.getTargetRole(), request.getExperienceLevel(),
+                        request.getDifficulty(), request.getQuestionCount()))
+                .startedAt(Instant.now())
+                .build();
+        interview = interviewRepository.save(interview);
+
+        // First AI message
+        String aiMessage = openAIService.chat(List.of(), interview.getSystemPrompt());
+        saveMessage(interview, "AI", aiMessage, 1);
+
+        byte[] audio = openAIService.textToSpeech(aiMessage);
+
+        return StartInterviewResponse.builder()
+                .interviewId(interview.getId())
+                .aiMessage(aiMessage)
+                .audioBase64(Base64.getEncoder().encodeToString(audio))
+                .mimeType("audio/mpeg")
+                .build();
+    }
+
+    // â”€â”€ Respond â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    @Transactional
+    public RespondResponse processUserResponse(UUID interviewId, String userContent, String userEmail) {
+        Interview interview = getAuthorizedInterview(interviewId, userEmail);
+
+        if (!"IN_PROGRESS".equals(interview.getStatus())) {
+            throw new IllegalStateException("Interview is not in progress");
+        }
+
+        int seq = transcriptRepo.countByInterview(interview);
+        saveMessage(interview, "USER", userContent, seq + 1);
+
+        List<InterviewMessage> history = buildHistory(interview);
+        String aiMessage = openAIService.chat(history, interview.getSystemPrompt());
+
+        boolean isLast = aiMessage.toLowerCase().contains("that wraps up") ||
+                         aiMessage.toLowerCase().contains("concludes our") ||
+                         aiMessage.toLowerCase().contains("end of our interview") ||
+                         aiMessage.toLowerCase().contains("great effort!");
+
+        saveMessage(interview, "AI", aiMessage, seq + 2);
+
+        byte[] audio = openAIService.textToSpeech(aiMessage);
+        long userMsgs = history.stream().filter(m -> "USER".equals(m.getSpeaker())).count();
+
+        return RespondResponse.builder()
+                .aiMessage(aiMessage)
+                .audioBase64(Base64.getEncoder().encodeToString(audio))
+                .mimeType("audio/mpeg")
+                .isLastQuestion(isLast)
+                .questionNumber((int) userMsgs + 1)
+                .build();
+    }
+
+    // â”€â”€ Transcribe Audio â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    public String transcribeAudio(UUID interviewId, String userEmail,
+                                   byte[] audioBytes, String mimeType) {
+        getAuthorizedInterview(interviewId, userEmail); // access check
+        return openAIService.transcribeAudio(audioBytes, mimeType);
+    }
+
+    // â”€â”€ End + Evaluate â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    @Transactional
+    public EvaluationResult endInterview(UUID interviewId, String userEmail) {
+        Interview interview = getAuthorizedInterview(interviewId, userEmail);
+
+        List<InterviewMessage> history = buildHistory(interview);
+        EvaluationResult result = openAIService.evaluateInterview(
+                history, interview.getTargetRole(), interview.getExperienceLevel());
+
+        interview.setStatus("COMPLETED");
+        interview.setCompletedAt(Instant.now());
+        interview.setDurationSeconds(
+                (int)(Instant.now().getEpochSecond() - interview.getStartedAt().getEpochSecond()));
+        interview.setTechnicalScore(result.getTechnicalScore());
+        interview.setCommunicationScore(result.getCommunicationScore());
+        interview.setProblemSolvingScore(result.getProblemSolvingScore());
+        interview.setDepthScore(result.getDepthScore());
+        interview.setOverallScore(result.getOverallScore());
+        interview.setVerdict(result.getVerdict());
+        interviewRepository.save(interview);
+
+        return result;
+    }
+
+    // â”€â”€ List â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    @Transactional(readOnly = true)
+    public List<InterviewSummaryDTO> getInterviewSummaries(String userEmail) {
+        User user = userRepository.findByEmail(userEmail)
+                .orElseThrow(() -> new RuntimeException("User not found"));
+        return interviewRepository.findByUserOrderByStartedAtDesc(user)
+                .stream()
+                .map(i -> InterviewSummaryDTO.builder()
+                        .id(i.getId())
+                        .targetRole(i.getTargetRole())
+                        .experienceLevel(i.getExperienceLevel())
+                        .difficulty(i.getDifficulty())
+                        .status(i.getStatus())
+                        .overallScore(i.getOverallScore())
+                        .verdict(i.getVerdict())
+                        .startedAt(i.getStartedAt())
+                        .durationSeconds(i.getDurationSeconds())
+                        .build())
+                .collect(Collectors.toList());
+    }
+
+    // â”€â”€ Detail â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    @Transactional(readOnly = true)
+    public InterviewDetailDTO getInterviewDetail(UUID interviewId, String userEmail) {
+        Interview interview = getAuthorizedInterview(interviewId, userEmail);
+        List<InterviewMessage> messages = transcriptRepo
+                .findByInterviewOrderBySequenceNumber(interview)
+                .stream()
+                .map(m -> InterviewMessage.builder()
+                        .speaker(m.getSpeaker())
+                        .content(m.getContent())
+                        .sequenceNumber(m.getSequenceNumber())
+                        .build())
+                .collect(Collectors.toList());
+
+        // rebuild evaluation if completed
+        EvaluationResult eval = null;
+        if ("COMPLETED".equals(interview.getStatus()) && interview.getOverallScore() != null) {
+            eval = EvaluationResult.builder()
+                    .technicalScore(nvl(interview.getTechnicalScore()))
+                    .communicationScore(nvl(interview.getCommunicationScore()))
+                    .problemSolvingScore(nvl(interview.getProblemSolvingScore()))
+                    .depthScore(nvl(interview.getDepthScore()))
+                    .overallScore(nvl(interview.getOverallScore()))
+                    .verdict(interview.getVerdict())
+                    .build();
+        }
+
+        return InterviewDetailDTO.builder()
+                .id(interview.getId())
+                .targetRole(interview.getTargetRole())
+                .status(interview.getStatus())
+                .transcript(messages)
+                .evaluation(eval)
+                .build();
+    }
+
+    // â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    private Interview getAuthorizedInterview(UUID id, String userEmail) {
+        Interview interview = interviewRepository.findById(id)
+                .orElseThrow(() -> new RuntimeException("Interview not found"));
+        if (!interview.getUser().getEmail().equals(userEmail))
+            throw new RuntimeException("Access denied");
+        return interview;
+    }
+
+    private TranscriptMessage saveMessage(Interview interview, String speaker,
+                                           String content, int seq) {
+        return transcriptRepo.save(TranscriptMessage.builder()
+                .interview(interview)
+                .speaker(speaker)
+                .content(content)
+                .sequenceNumber(seq)
+                .build());
+    }
+
+    private List<InterviewMessage> buildHistory(Interview interview) {
+        return transcriptRepo.findByInterviewOrderBySequenceNumber(interview)
+                .stream()
+                .map(m -> InterviewMessage.builder()
+                        .speaker(m.getSpeaker())
+                        .content(m.getContent())
+                        .sequenceNumber(m.getSequenceNumber())
+                        .build())
+                .collect(Collectors.toList());
+    }
+
+    private double nvl(Double d) { return d == null ? 0.0 : d; }
+}
+
+
+
+================================================
+FILE: OpenAIService.java
+================================================
+package com.iprep.service;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.iprep.dto.EvaluationResult;
+import com.iprep.dto.InterviewMessage;
+import com.iprep.exception.OpenAIException;
+import lombok.extern.slf4j.Slf4j;
+import okhttp3.*;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+
+import java.io.IOException;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * AIService â€” powered by FREE alternatives:
+ *
+ *   CHAT / EVAL  â†’  Groq API  (Llama 3.3 70B â€” free tier, very fast)
+ *                   https://console.groq.com  â†’  "Create API Key"
+ *
+ *   TTS          â†’  NOT handled here. Moved to browser Web Speech API
+ *                   (SpeechSynthesis) â€” completely free, no key needed.
+ *
+ *   STT          â†’  Groq Whisper (whisper-large-v3-turbo â€” free tier)
+ *                   Same API key as chat.
+ *
+ * The Groq API is 100% OpenAI-compatible â€” same JSON schema, same endpoints.
+ * Only the base URL and model names change.
+ */
+@Slf4j
+@Service
+public class OpenAIService {
+
+    // â”€â”€ Groq credentials (set GROQ_API_KEY in your .env) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    @Value("${groq.api-key}")
+    private String apiKey;
+
+    @Value("${groq.base-url:https://api.groq.com/openai/v1}")
+    private String baseUrl;
+
+    @Value("${groq.chat-model:llama-3.3-70b-versatile}")
+    private String chatModel;
+
+    @Value("${groq.whisper-model:whisper-large-v3-turbo}")
+    private String whisperModel;
+
+    @Value("${groq.max-tokens:1024}")
+    private int maxTokens;
+
+    @Value("${groq.temperature:0.7}")
+    private double temperature;
+
+    private final OkHttpClient httpClient = new OkHttpClient.Builder()
+            .connectTimeout(30, TimeUnit.SECONDS)
+            .readTimeout(120, TimeUnit.SECONDS)
+            .writeTimeout(30, TimeUnit.SECONDS)
+            .build();
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    // =========================================================================
+    // 1. CHAT  â€”  Groq Llama 3.3 70B  (interview Q&A)
+    // =========================================================================
+    public String chat(List<InterviewMessage> messages, String systemPrompt) {
+        try {
+            ObjectNode body = objectMapper.createObjectNode();
+            body.put("model", chatModel);
+            body.put("max_tokens", maxTokens);
+            body.put("temperature", temperature);
+
+            ArrayNode msgs = body.putArray("messages");
+            msgs.addObject().put("role", "system").put("content", systemPrompt);
+
+            for (InterviewMessage msg : messages) {
+                msgs.addObject()
+                    .put("role", "USER".equals(msg.getSpeaker()) ? "user" : "assistant")
+                    .put("content", msg.getContent());
+            }
+
+            Request request = buildJsonRequest(baseUrl + "/chat/completions", body);
+            try (Response response = httpClient.newCall(request).execute()) {
+                String rb = response.body().string();
+                if (!response.isSuccessful()) {
+                    log.error("Groq Chat error {}: {}", response.code(), rb);
+                    throw new OpenAIException("Groq Chat API error " + response.code() + ": " + rb);
+                }
+                JsonNode json = objectMapper.readTree(rb);
+                return json.at("/choices/0/message/content").asText();
+            }
+        } catch (IOException e) {
+            throw new OpenAIException("Chat IO error: " + e.getMessage());
+        }
+    }
+
+    // =========================================================================
+    // 2. TTS  â€”  NOT on the backend anymore!
+    //
+    //    The frontend uses the browser's built-in Web Speech API:
+    //      window.speechSynthesis.speak(new SpeechSynthesisUtterance(text))
+    //
+    //    This method still exists so InterviewService compiles unchanged,
+    //    but it returns an empty byte array â€” the frontend ignores audioBase64
+    //    when it is empty and falls back to Web Speech API instead.
+    // =========================================================================
+    public byte[] textToSpeech(String text) {
+        // TTS is handled by the browser (Web Speech API).
+        // Return empty â€” frontend detects this and uses SpeechSynthesis.
+        log.debug("TTS skipped on backend â€” handled by browser Web Speech API");
+        return new byte[0];
+    }
+
+    // =========================================================================
+    // 3. STT  â€”  Groq Whisper (whisper-large-v3-turbo, free tier)
+    // =========================================================================
+    public String transcribeAudio(byte[] audioBytes, String mimeType) {
+        try {
+            String extension = mimeType.contains("webm") ? "webm"
+                    : mimeType.contains("wav")  ? "wav"
+                    : mimeType.contains("mp4")  ? "mp4"
+                    : mimeType.contains("ogg")  ? "ogg" : "webm";
+
+            RequestBody audioBody = RequestBody.create(audioBytes, MediaType.parse(mimeType));
+            MultipartBody multipart = new MultipartBody.Builder()
+                    .setType(MultipartBody.FORM)
+                    .addFormDataPart("model", whisperModel)
+                    .addFormDataPart("language", "en")
+                    .addFormDataPart("response_format", "json")
+                    .addFormDataPart("file", "recording." + extension, audioBody)
+                    .build();
+
+            Request request = new Request.Builder()
+                    .url(baseUrl + "/audio/transcriptions")
+                    .addHeader("Authorization", "Bearer " + apiKey)
+                    .post(multipart)
+                    .build();
+
+            try (Response response = httpClient.newCall(request).execute()) {
+                String rb = response.body().string();
+                if (!response.isSuccessful()) {
+                    log.error("Groq Whisper error {}: {}", response.code(), rb);
+                    throw new OpenAIException("Whisper error " + response.code() + ": " + rb);
+                }
+                return objectMapper.readTree(rb).path("text").asText("").trim();
+            }
+        } catch (IOException e) {
+            throw new OpenAIException("Whisper IO error: " + e.getMessage());
+        }
+    }
+
+    // =========================================================================
+    // 4. EVALUATION  â€”  Groq Llama 3.3 70B  (final report)
+    // =========================================================================
+    public EvaluationResult evaluateInterview(List<InterviewMessage> transcript,
+                                               String targetRole,
+                                               String experienceLevel) {
+        try {
+            ObjectNode body = objectMapper.createObjectNode();
+            body.put("model", chatModel);
+            body.put("max_tokens", 2048);
+            body.put("temperature", 0.2);    // low temp = deterministic JSON
+
+            ArrayNode msgs = body.putArray("messages");
+            msgs.addObject()
+                .put("role", "system")
+                .put("content", "You are a strict technical interview evaluator. "
+                    + "Return ONLY valid JSON â€” no markdown fences, no explanation, no extra text.");
+            msgs.addObject()
+                .put("role", "user")
+                .put("content", buildEvaluationPrompt(transcript, targetRole, experienceLevel));
+
+            Request request = buildJsonRequest(baseUrl + "/chat/completions", body);
+            try (Response response = httpClient.newCall(request).execute()) {
+                String rb = response.body().string();
+                if (!response.isSuccessful()) {
+                    throw new OpenAIException("Evaluation API error " + response.code());
+                }
+                String content = objectMapper.readTree(rb)
+                        .at("/choices/0/message/content").asText()
+                        .replaceAll("(?s)```json\\s*", "")
+                        .replaceAll("(?s)```\\s*", "")
+                        .trim();
+                return objectMapper.readValue(content, EvaluationResult.class);
+            }
+        } catch (IOException e) {
+            throw new OpenAIException("Evaluation IO error: " + e.getMessage());
+        }
+    }
+
+    // =========================================================================
+    // 5. SYSTEM PROMPT BUILDER
+    // =========================================================================
+    public String buildSystemPrompt(String targetRole, String experienceLevel,
+                                     String difficulty, int questionCount) {
+        return """
+                You are Alex, a Senior Technical Interviewer at a top tech company.
+                Role being interviewed for: %s
+                Candidate level: %s | Difficulty: %s | Questions to ask: %d
+
+                RULES:
+                1. Ask exactly ONE question at a time â€” never stack questions.
+                2. Ask follow-ups if an answer is incomplete, vague, or wrong.
+                3. After thoroughly covering a topic, move to the next question naturally.
+                4. After all %d questions, end with: "That wraps up our session â€” great effort!"
+                5. Acknowledge good answers briefly. Give small hints if they are stuck.
+                6. Do NOT score or evaluate during the interview.
+                7. Match technical depth to the %s level.
+                8. Keep responses concise â€” you are conducting an interview, not lecturing.
+
+                Start with a warm professional greeting and your first question.
+                """.formatted(targetRole, experienceLevel, difficulty, questionCount,
+                              questionCount, experienceLevel);
+    }
+
+    // =========================================================================
+    // Private helpers
+    // =========================================================================
+    private String buildEvaluationPrompt(List<InterviewMessage> transcript,
+                                          String targetRole, String experienceLevel) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("Evaluate this technical interview for a ").append(targetRole)
+          .append(" position at ").append(experienceLevel).append(" level.\n\n## Transcript:\n");
+        for (InterviewMessage msg : transcript) {
+            sb.append("[").append(msg.getSpeaker()).append("]: ")
+              .append(msg.getContent()).append("\n\n");
+        }
+        sb.append("""
+                Return ONLY this JSON object (no extra text, no markdown):
+                {
+                  "technicalScore": <1-10>,
+                  "communicationScore": <1-10>,
+                  "problemSolvingScore": <1-10>,
+                  "depthScore": <1-10>,
+                  "overallScore": <1-10>,
+                  "verdict": "<READY_FOR_PLACEMENT|BORDERLINE|NEEDS_MORE_PRACTICE>",
+                  "verdictTitle": "<short title>",
+                  "verdictDescription": "<2-3 sentence summary>",
+                  "strengths": ["<str1>", "<str2>", "<str3>"],
+                  "areasForImprovement": ["<area1>", "<area2>", "<area3>"],
+                  "questionScores": [{"questionNumber": 1, "score": <1-10>, "feedback": "<sentence>"}],
+                  "correctnessAnalysis": "<detailed paragraph>",
+                  "recommendedTopics": ["<topic1>", "<topic2>", "<topic3>"]
+                }
+                """);
+        return sb.toString();
+    }
+
+    private Request buildJsonRequest(String url, ObjectNode body) throws IOException {
+        String json = objectMapper.writeValueAsString(body);
+        return new Request.Builder()
+                .url(url)
+                .addHeader("Authorization", "Bearer " + apiKey)
+                .addHeader("Content-Type", "application/json")
+                .post(RequestBody.create(json, MediaType.parse("application/json")))
+                .build();
+    }
+}
+
+
+
+================================================
+FILE: IprepApplication.java
+================================================
+package com.iprep;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+public class IprepApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(IprepApplication.class, args);
+    }
+}
+
+
+
+================================================
+FILE: application.properties
+================================================
+# ============================================================
+# iPrep Application Configuration â€” Groq Free Tier Edition
+# ============================================================
+spring.application.name=iprep-backend
+
+# --- Server ---
+server.port=${PORT:8080}
+
+# --- Database ---
+spring.datasource.url=${DATABASE_URL:jdbc:postgresql://localhost:5432/iprep_db}
+spring.datasource.username=${DATABASE_USERNAME:postgres}
+spring.datasource.password=${DATABASE_PASSWORD:postgres}
+spring.datasource.driver-class-name=org.postgresql.Driver
+
+# --- JPA ---
+spring.jpa.hibernate.ddl-auto=validate
+spring.jpa.show-sql=false
+spring.jpa.properties.hibernate.dialect=org.hibernate.dialect.PostgreSQLDialect
+
+# --- SQL Init ---
+spring.sql.init.mode=always
+spring.sql.init.schema-locations=classpath:schema.sql
+
+# --- Multipart (audio uploads for Whisper) ---
+spring.servlet.multipart.enabled=true
+spring.servlet.multipart.max-file-size=25MB
+spring.servlet.multipart.max-request-size=25MB
+
+# --- JWT ---
+jwt.secret=${JWT_SECRET:iPrep_Secret_Key_Min_32_Chars_Change_In_Prod!}
+jwt.access-token-expiry-ms=86400000
+
+# ============================================================
+# GROQ FREE TIER â€” https://console.groq.com â†’ API Keys
+# Free limits (as of 2025):
+#   llama-3.3-70b-versatile   : 14,400 requests/day, 500,000 tokens/day
+#   whisper-large-v3-turbo    : 7,200 requests/day, 28,800 seconds audio/day
+# ============================================================
+groq.api-key=${GROQ_API_KEY}
+groq.base-url=https://api.groq.com/openai/v1
+groq.chat-model=llama-3.3-70b-versatile
+groq.whisper-model=whisper-large-v3-turbo
+groq.max-tokens=1024
+groq.temperature=0.7
+
+# --- CORS ---
+app.cors.allowed-origins=${CORS_ORIGINS:http://localhost:5173,http://localhost:3000}
+
+# --- Logging ---
+logging.level.com.iprep=DEBUG
+logging.level.org.springframework.security=WARN
+
+
+
+================================================
+FILE: schema.sql
+================================================
+-- iPrep Database Schema â€” PostgreSQL 14+
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+CREATE TABLE IF NOT EXISTS users (
+    id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    email       VARCHAR(255) UNIQUE NOT NULL,
+    password    VARCHAR(255) NOT NULL,
+    full_name   VARCHAR(255) NOT NULL,
+    role        VARCHAR(50)  NOT NULL DEFAULT 'USER',
+    active      BOOLEAN      NOT NULL DEFAULT TRUE,
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS interviews (
+    id                  UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id             UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    target_role         VARCHAR(255) NOT NULL,
+    experience_level    VARCHAR(50)  NOT NULL,
+    difficulty          VARCHAR(20)  NOT NULL DEFAULT 'MEDIUM',
+    status              VARCHAR(30)  NOT NULL DEFAULT 'IN_PROGRESS',
+    question_count      INTEGER      NOT NULL DEFAULT 5,
+    system_prompt       TEXT,
+    technical_score     DOUBLE PRECISION,
+    communication_score DOUBLE PRECISION,
+    problem_solving_score DOUBLE PRECISION,
+    depth_score         DOUBLE PRECISION,
+    overall_score       DOUBLE PRECISION,
+    verdict             VARCHAR(50),
+    started_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    completed_at        TIMESTAMPTZ,
+    duration_seconds    INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS transcript_messages (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    interview_id    UUID NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,
+    sequence_number INTEGER NOT NULL,
+    speaker         VARCHAR(10) NOT NULL,
+    content         TEXT NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_interviews_user_id     ON interviews(user_id);
+CREATE INDEX IF NOT EXISTS idx_interviews_status      ON interviews(status);
+CREATE INDEX IF NOT EXISTS idx_transcripts_interview  ON transcript_messages(interview_id, sequence_number);
+
+
+
+================================================
+FILE: schema.sql
+================================================
+-- ============================================================
+-- iPrep Database Schema
+-- PostgreSQL 15+
+-- ============================================================
+
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- â”€â”€ Users â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+CREATE TABLE users (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    email       VARCHAR(255) NOT NULL UNIQUE,
+    password    VARCHAR(255) NOT NULL,           -- BCrypt hash
+    full_name   VARCHAR(100) NOT NULL,
+    role        VARCHAR(20)  NOT NULL DEFAULT 'USER', -- USER | ADMIN
+    avatar_url  VARCHAR(500),
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    is_active   BOOLEAN      NOT NULL DEFAULT TRUE
+);
+
+CREATE INDEX idx_users_email ON users(email);
+
+-- â”€â”€ Interviews â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+CREATE TABLE interviews (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    target_role     VARCHAR(100) NOT NULL,
+    experience_level VARCHAR(30) NOT NULL,       -- FRESHER | MID | SENIOR
+    difficulty      VARCHAR(10)  NOT NULL,       -- EASY | MEDIUM | HARD
+    status          VARCHAR(20)  NOT NULL DEFAULT 'IN_PROGRESS', -- IN_PROGRESS | COMPLETED | ABANDONED
+    question_count  INTEGER      NOT NULL DEFAULT 5,
+    started_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    completed_at    TIMESTAMPTZ,
+    duration_seconds INTEGER,
+    -- Evaluation scores (populated on completion)
+    technical_score  NUMERIC(3,1),               -- 1.0 â€“ 10.0
+    communication_score NUMERIC(3,1),
+    problem_solving_score NUMERIC(3,1),
+    depth_score      NUMERIC(3,1),
+    overall_score    NUMERIC(3,1),
+    verdict          VARCHAR(50),                -- READY | BORDERLINE | NEEDS_WORK
+    -- Full AI evaluation JSON
+    evaluation_json  JSONB
+);
+
+CREATE INDEX idx_interviews_user_id ON interviews(user_id);
+CREATE INDEX idx_interviews_status  ON interviews(status);
+CREATE INDEX idx_interviews_created ON interviews(started_at DESC);
+
+-- â”€â”€ Transcript Messages â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+CREATE TABLE transcript_messages (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    interview_id    UUID NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,
+    sequence_number INTEGER NOT NULL,
+    speaker         VARCHAR(10) NOT NULL,        -- AI | USER
+    content         TEXT NOT NULL,               -- raw text
+    audio_url       VARCHAR(500),                -- S3 / local path for TTS audio
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    -- Per-message scoring (optional, populated by AI evaluation)
+    question_score  INTEGER,                     -- 1â€“10 for user answer messages
+    question_feedback TEXT
+);
+
+CREATE INDEX idx_transcript_interview ON transcript_messages(interview_id, sequence_number);
+
+-- â”€â”€ Refresh Tokens â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+CREATE TABLE refresh_tokens (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token       VARCHAR(500) NOT NULL UNIQUE,
+    expires_at  TIMESTAMPTZ NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    is_revoked  BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+CREATE INDEX idx_refresh_token ON refresh_tokens(token);
+
+-- â”€â”€ Trigger: auto-update updated_at â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+CREATE OR REPLACE FUNCTION update_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN NEW.updated_at = NOW(); RETURN NEW; END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_users_updated_at
+    BEFORE UPDATE ON users
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+
+-- â”€â”€ Seed data (dev) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+INSERT INTO users (email, password, full_name) VALUES
+  ('demo@iprep.dev',
+   '$2a$12$xVGb4sQ2Jq5qH8RKk7yKVeZBvvkBvQ6dEzZq0Qd9VhJ6cLZ1s7UvK',  -- demo1234
+   'Arjun Kumar');
+
+
+
+================================================
+FILE: AuthContext.jsx
+================================================
+import { createContext, useContext, useState, useEffect, useCallback } from 'react'
+import api from '../services/api'
+
+const AuthContext = createContext(null)
+
+export function AuthProvider({ children }) {
+  const [user, setUser]       = useState(null)
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    const token = localStorage.getItem('iprep_token')
+    const saved = localStorage.getItem('iprep_user')
+    if (token && saved) setUser(JSON.parse(saved))
+    setLoading(false)
+  }, [])
+
+  const login = useCallback(async (email, password) => {
+    const { data } = await api.post('/api/v1/auth/login', { email, password })
+    localStorage.setItem('iprep_token', data.accessToken)
+    localStorage.setItem('iprep_user', JSON.stringify({ email: data.email, fullName: data.fullName }))
+    setUser({ email: data.email, fullName: data.fullName })
+    return data
+  }, [])
+
+  const register = useCallback(async (fullName, email, password) => {
+    const { data } = await api.post('/api/v1/auth/register', { fullName, email, password })
+    localStorage.setItem('iprep_token', data.accessToken)
+    localStorage.setItem('iprep_user', JSON.stringify({ email: data.email, fullName: data.fullName }))
+    setUser({ email: data.email, fullName: data.fullName })
+    return data
+  }, [])
+
+  const logout = useCallback(() => {
+    localStorage.removeItem('iprep_token')
+    localStorage.removeItem('iprep_user')
+    setUser(null)
+  }, [])
+
+  return (
+    <AuthContext.Provider value={{ user, loading, login, register, logout }}>
+      {children}
+    </AuthContext.Provider>
+  )
+}
+
+export const useAuth = () => {
+  const ctx = useContext(AuthContext)
+  if (!ctx) throw new Error('useAuth must be inside AuthProvider')
+  return ctx
+}
+
+
+
+================================================
+FILE: useAudioPlayer.js
+================================================
+/**
+ * useAudioPlayer
+ *
+ * PRIMARY:   Browser Web Speech API (SpeechSynthesis) â€” completely free,
+ *            works in all modern browsers, no API key needed.
+ *
+ * FALLBACK:  If the backend still returns a non-empty Base64 audio blob
+ *            (e.g. you later swap back to OpenAI TTS), it plays that instead.
+ *
+ * Usage:
+ *   const { isPlaying, speak, playBase64Audio, stop } = useAudioPlayer()
+ *   await speak("Hello, welcome to your interview.")
+ */
+import { useState, useRef, useCallback, useEffect } from 'react'
+
+export function useAudioPlayer() {
+  const [isPlaying, setIsPlaying] = useState(false)
+  const audioRef   = useRef(null)
+  const utterRef   = useRef(null)
+
+  // Cancel any speech on unmount
+  useEffect(() => () => {
+    window.speechSynthesis?.cancel()
+    audioRef.current?.pause()
+  }, [])
+
+  // â”€â”€ Web Speech API TTS (primary, free) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  const speak = useCallback((text, options = {}) => {
+    return new Promise((resolve, reject) => {
+      if (!window.speechSynthesis) {
+        reject(new Error('SpeechSynthesis not supported'))
+        return
+      }
+
+      window.speechSynthesis.cancel() // stop anything currently playing
+
+      const utterance = new SpeechSynthesisUtterance(text)
+      utterRef.current = utterance
+
+      // Voice selection: prefer a natural English voice
+      const voices = window.speechSynthesis.getVoices()
+      const preferred = voices.find(v =>
+        v.name.includes('Google UK English Male') ||
+        v.name.includes('Google US English') ||
+        v.name.includes('Daniel') ||                // macOS
+        v.name.includes('Alex') ||                  // macOS
+        (v.lang.startsWith('en') && !v.localService === false)
+      ) || voices.find(v => v.lang.startsWith('en')) || voices[0]
+
+      if (preferred) utterance.voice = preferred
+      utterance.rate   = options.rate   ?? 0.95
+      utterance.pitch  = options.pitch  ?? 1.0
+      utterance.volume = options.volume ?? 1.0
+      utterance.lang   = 'en-US'
+
+      utterance.onstart = () => setIsPlaying(true)
+      utterance.onend   = () => { setIsPlaying(false); resolve() }
+      utterance.onerror = e  => { setIsPlaying(false); reject(e) }
+
+      // Chrome bug: voices may not be loaded on first call â€” retry once
+      setTimeout(() => window.speechSynthesis.speak(utterance), 50)
+    })
+  }, [])
+
+  // â”€â”€ Base64 audio fallback (if backend sends TTS audio bytes) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  const playBase64Audio = useCallback((b64, mimeType = 'audio/mpeg') => {
+    // If backend sends empty bytes (our Groq setup), fall back to speak()
+    if (!b64 || b64.length < 10) return Promise.resolve()
+
+    return new Promise((resolve, reject) => {
+      window.speechSynthesis?.cancel()
+      if (audioRef.current) { audioRef.current.pause(); audioRef.current = null }
+
+      const raw   = atob(b64)
+      const bytes = new Uint8Array(raw.length)
+      for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i)
+      const blob  = new Blob([bytes], { type: mimeType })
+      const url   = URL.createObjectURL(blob)
+
+      const audio = new Audio(url)
+      audioRef.current = audio
+      audio.onplay  = () => setIsPlaying(true)
+      audio.onended = () => { setIsPlaying(false); URL.revokeObjectURL(url); resolve() }
+      audio.onerror = e  => { setIsPlaying(false); URL.revokeObjectURL(url); reject(e) }
+      audio.play().catch(reject)
+    })
+  }, [])
+
+  const stop = useCallback(() => {
+    window.speechSynthesis?.cancel()
+    audioRef.current?.pause()
+    audioRef.current = null
+    setIsPlaying(false)
+  }, [])
+
+  return { isPlaying, speak, playBase64Audio, stop }
+}
+
+
+
+================================================
+FILE: useAudioRecorder.js
+================================================
+import { useState, useRef, useCallback } from 'react'
+
+/**
+ * useAudioRecorder
+ * Wraps the MediaRecorder API to capture mic audio as WebM blobs.
+ * The blobs are sent to OpenAI Whisper for server-side transcription.
+ */
+export function useAudioRecorder() {
+  const [isRecording, setIsRecording] = useState(false)
+  const [error, setError]             = useState(null)
+  const recorderRef = useRef(null)
+  const chunksRef   = useRef([])
+  const streamRef   = useRef(null)
+
+  const startRecording = useCallback(async () => {
+    setError(null)
+    chunksRef.current = []
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false })
+      streamRef.current = stream
+      const opts = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+        ? { mimeType: 'audio/webm;codecs=opus' } : {}
+      const rec = new MediaRecorder(stream, opts)
+      recorderRef.current = rec
+      rec.ondataavailable = e => { if (e.data.size > 0) chunksRef.current.push(e.data) }
+      rec.start(250)
+      setIsRecording(true)
+    } catch (err) {
+      setError(err.message || 'Microphone access denied')
+    }
+  }, [])
+
+  const stopRecording = useCallback(() =>
+    new Promise(resolve => {
+      const rec = recorderRef.current
+      if (!rec || rec.state === 'inactive') { resolve(null); return }
+      rec.onstop = () => {
+        const blob = new Blob(chunksRef.current, { type: 'audio/webm' })
+        streamRef.current?.getTracks().forEach(t => t.stop())
+        streamRef.current = null
+        setIsRecording(false)
+        resolve(blob)
+      }
+      rec.stop()
+    }), [])
+
+  const cancelRecording = useCallback(() => {
+    recorderRef.current?.stop()
+    streamRef.current?.getTracks().forEach(t => t.stop())
+    streamRef.current = null
+    chunksRef.current = []
+    setIsRecording(false)
+  }, [])
+
+  return { isRecording, error, startRecording, stopRecording, cancelRecording }
+}
+
+
+
+================================================
+FILE: DashboardPage.jsx
+================================================
+import { useState, useEffect } from 'react'
+import { useNavigate } from 'react-router-dom'
+import { useAuth } from '../context/AuthContext'
+import { interviewService } from '../services/interviewService'
+import {
+  Zap, Plus, LogOut, Clock, TrendingUp, Award, ChevronRight,
+  BookOpen, BarChart2, CheckCircle, AlertCircle, XCircle
+} from 'lucide-react'
+
+const VERDICT_CONFIG = {
+  READY_FOR_PLACEMENT: { icon: CheckCircle, color: 'text-emerald-400', bg: 'bg-emerald-500/10 border-emerald-500/30', label: 'Ready' },
+  BORDERLINE:          { icon: AlertCircle, color: 'text-yellow-400',  bg: 'bg-yellow-500/10 border-yellow-500/30',  label: 'Borderline' },
+  NEEDS_MORE_PRACTICE: { icon: XCircle,     color: 'text-red-400',     bg: 'bg-red-500/10 border-red-500/30',        label: 'Needs Practice' },
+}
+
+const DIFF_COLOR = { EASY: 'text-emerald-400 bg-emerald-500/10', MEDIUM: 'text-yellow-400 bg-yellow-500/10', HARD: 'text-red-400 bg-red-500/10' }
+
+function ScoreRing({ score = 0 }) {
+  const r = 30, circ = 2 * Math.PI * r
+  const pct = Math.min(score / 10, 1)
+  return (
+    <div className="relative w-20 h-20">
+      <svg className="w-full h-full -rotate-90" viewBox="0 0 80 80">
+        <circle cx="40" cy="40" r={r} fill="none" stroke="rgba(255,255,255,0.05)" strokeWidth="6" />
+        <circle cx="40" cy="40" r={r} fill="none" stroke="#6366f1" strokeWidth="6"
+          strokeDasharray={circ} strokeDashoffset={circ * (1 - pct)}
+          strokeLinecap="round" style={{ transition: 'stroke-dashoffset 1s ease' }} />
+      </svg>
+      <div className="absolute inset-0 flex flex-col items-center justify-center">
+        <span className="text-lg font-bold font-display text-white">{score?.toFixed(1) ?? 'â€“'}</span>
+        <span className="text-xs text-white/40">/ 10</span>
+      </div>
+    </div>
+  )
+}
+
+export default function DashboardPage() {
+  const { user, logout } = useAuth()
+  const navigate = useNavigate()
+  const [interviews, setInterviews] = useState([])
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    interviewService.list()
+      .then(r => setInterviews(r.data))
+      .catch(console.error)
+      .finally(() => setLoading(false))
+  }, [])
+
+  const completed  = interviews.filter(i => i.status === 'COMPLETED')
+  const avgScore   = completed.length
+    ? (completed.reduce((s, i) => s + (i.overallScore || 0), 0) / completed.length).toFixed(1)
+    : 'â€“'
+  const bestScore  = completed.length
+    ? Math.max(...completed.map(i => i.overallScore || 0)).toFixed(1)
+    : 'â€“'
+
+  const fmtDuration = (secs) => {
+    if (!secs) return 'â€“'
+    const m = Math.floor(secs / 60), s = secs % 60
+    return `${m}m ${s}s`
+  }
+
+  return (
+    <div className="min-h-screen bg-surface-950">
+      {/* Background */}
+      <div className="fixed inset-0 pointer-events-none overflow-hidden">
+        <div className="absolute -top-40 -right-40 w-96 h-96 bg-brand-600/8 rounded-full blur-3xl" />
+        <div className="absolute top-1/2 -left-40 w-96 h-96 bg-brand-800/8 rounded-full blur-3xl" />
+      </div>
+
+      {/* Navbar */}
+      <nav className="relative z-10 border-b border-white/5 px-6 py-4">
+        <div className="max-w-6xl mx-auto flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <div className="w-8 h-8 bg-brand-600 rounded-lg flex items-center justify-center">
+              <Zap className="w-4 h-4 text-white" />
+            </div>
+            <span className="font-display font-bold text-white text-lg">iPrep</span>
+          </div>
+          <div className="flex items-center gap-4">
+            <span className="text-white/50 text-sm hidden sm:block">
+              {user?.fullName}
+            </span>
+            <button onClick={logout}
+              className="flex items-center gap-1.5 text-white/40 hover:text-white/80 transition-colors text-sm">
+              <LogOut className="w-4 h-4" />
+              <span className="hidden sm:block">Sign out</span>
+            </button>
+          </div>
+        </div>
+      </nav>
+
+      <main className="relative z-10 max-w-6xl mx-auto px-6 py-10">
+        {/* Header */}
+        <div className="flex items-start justify-between mb-10">
+          <div>
+            <h1 className="font-display text-3xl font-bold text-white mb-1">
+              Hey, {user?.fullName?.split(' ')[0]} ðŸ‘‹
+            </h1>
+            <p className="text-white/50">Ready to ace your next interview?</p>
+          </div>
+          <button onClick={() => navigate('/interview/new')}
+            className="flex items-center gap-2 bg-brand-600 hover:bg-brand-500 text-white font-semibold px-5 py-2.5 rounded-xl transition-all duration-200 glow-brand">
+            <Plus className="w-4 h-4" />
+            <span>New Interview</span>
+          </button>
+        </div>
+
+        {/* Stats */}
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-10">
+          {[
+            { icon: BookOpen, label: 'Total Sessions', value: interviews.length, color: 'text-brand-400' },
+            { icon: BarChart2, label: 'Avg Score', value: avgScore, color: 'text-purple-400' },
+            { icon: Award, label: 'Best Score', value: bestScore, color: 'text-yellow-400' },
+          ].map(({ icon: Icon, label, value, color }) => (
+            <div key={label} className="glass rounded-2xl p-5 flex items-center gap-4">
+              <div className={`p-3 rounded-xl bg-white/5 ${color}`}>
+                <Icon className="w-5 h-5" />
+              </div>
+              <div>
+                <p className="text-white/40 text-xs font-medium uppercase tracking-wider">{label}</p>
+                <p className="text-2xl font-display font-bold text-white">{value}</p>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* Interview List */}
+        <div>
+          <h2 className="font-display text-lg font-bold text-white mb-4">Interview History</h2>
+
+          {loading ? (
+            <div className="flex justify-center py-16">
+              <div className="w-8 h-8 border-2 border-brand-500 border-t-transparent rounded-full animate-spin" />
+            </div>
+          ) : interviews.length === 0 ? (
+            <div className="glass rounded-2xl p-16 text-center">
+              <div className="w-16 h-16 bg-brand-600/10 rounded-2xl flex items-center justify-center mx-auto mb-4">
+                <Zap className="w-8 h-8 text-brand-400" />
+              </div>
+              <h3 className="font-display text-xl font-bold text-white mb-2">No interviews yet</h3>
+              <p className="text-white/40 mb-6">Start your first mock interview to see your results here.</p>
+              <button onClick={() => navigate('/interview/new')}
+                className="bg-brand-600 hover:bg-brand-500 text-white font-semibold px-6 py-2.5 rounded-xl transition-colors">
+                Start Interview
+              </button>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {interviews.map(interview => {
+                const verdict = VERDICT_CONFIG[interview.verdict] || {}
+                const VIcon = verdict.icon
+                const isCompleted = interview.status === 'COMPLETED'
+                return (
+                  <div key={interview.id}
+                    className="glass rounded-2xl p-5 flex items-center gap-5 hover:border-brand-500/30 transition-all duration-200 cursor-pointer group"
+                    onClick={() => isCompleted && navigate(`/interview/${interview.id}/report`)}>
+
+                    {isCompleted
+                      ? <ScoreRing score={interview.overallScore} />
+                      : <div className="w-20 h-20 rounded-full border-2 border-dashed border-white/10 flex items-center justify-center text-white/30 text-xs">In Progress</div>
+                    }
+
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 flex-wrap mb-1">
+                        <h3 className="font-semibold text-white">{interview.targetRole}</h3>
+                        <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${DIFF_COLOR[interview.difficulty] || 'text-white/40 bg-white/5'}`}>
+                          {interview.difficulty}
+                        </span>
+                        {interview.experienceLevel && (
+                          <span className="text-xs px-2 py-0.5 rounded-full bg-white/5 text-white/40">
+                            {interview.experienceLevel}
+                          </span>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-4 text-sm text-white/40">
+                        {interview.startedAt && (
+                          <span className="flex items-center gap-1">
+                            <Clock className="w-3.5 h-3.5" />
+                            {new Date(interview.startedAt).toLocaleDateString()}
+                          </span>
+                        )}
+                        {interview.durationSeconds && (
+                          <span className="flex items-center gap-1">
+                            <TrendingUp className="w-3.5 h-3.5" />
+                            {fmtDuration(interview.durationSeconds)}
+                          </span>
+                        )}
+                        {verdict.label && VIcon && (
+                          <span className={`flex items-center gap-1 text-xs px-2 py-0.5 rounded-full border ${verdict.bg} ${verdict.color}`}>
+                            <VIcon className="w-3 h-3" />{verdict.label}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+
+                    {isCompleted && (
+                      <ChevronRight className="w-5 h-5 text-white/20 group-hover:text-brand-400 transition-colors shrink-0" />
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </div>
+      </main>
+    </div>
+  )
+}
+
+
+
+================================================
+FILE: LiveInterviewPage.jsx
+================================================
+import { useState, useEffect, useRef, useCallback } from 'react'
+import { useParams, useLocation, useNavigate } from 'react-router-dom'
+import { useAudioRecorder } from '../hooks/useAudioRecorder'
+import { useAudioPlayer }   from '../hooks/useAudioPlayer'
+import { interviewService } from '../services/interviewService'
+import {
+  Mic, MicOff, Send, StopCircle, Volume2, VolumeX,
+  AlertCircle, Loader2, User, Bot
+} from 'lucide-react'
+
+/* â”€â”€ Animated waveform â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+function Waveform({ active }) {
+  return (
+    <div className="flex items-end gap-0.5 h-5">
+      {[...Array(9)].map((_, i) => (
+        <div key={i}
+          className={`w-1 rounded-full ${active ? 'bg-brand-400' : 'bg-white/20'}`}
+          style={{
+            height: active ? `${30 + Math.sin((i * 1.4)) * 70}%` : '30%',
+            animation: active ? `waveform ${0.8 + i * 0.1}s ease-in-out infinite` : 'none',
+            animationDelay: `${i * 0.08}s`,
+          }}
+        />
+      ))}
+    </div>
+  )
+}
+
+/* â”€â”€ Transcript bubble â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+function Bubble({ msg }) {
+  const isAI = msg.speaker === 'AI'
+  return (
+    <div className={`flex gap-3 ${isAI ? '' : 'flex-row-reverse'}`}>
+      <div className={`w-8 h-8 rounded-full flex items-center justify-center shrink-0 mt-0.5 ${
+        isAI ? 'bg-brand-600/30 text-brand-400' : 'bg-white/10 text-white/60'
+      }`}>
+        {isAI ? <Bot className="w-4 h-4" /> : <User className="w-4 h-4" />}
+      </div>
+      <div className={`max-w-[78%] px-4 py-3 rounded-2xl text-sm leading-relaxed ${
+        isAI
+          ? 'bg-surface-700 text-white/90 rounded-tl-sm'
+          : 'bg-brand-600/20 border border-brand-500/20 text-white/90 rounded-tr-sm'
+      }`}>
+        {msg.content}
+      </div>
+    </div>
+  )
+}
+
+/* â”€â”€ MAIN â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+export default function LiveInterviewPage() {
+  const { id }    = useParams()
+  const location  = useLocation()
+  const navigate  = useNavigate()
+  const startData = location.state?.startData
+
+  const [transcript,     setTranscript]     = useState([])
+  const [inputText,      setInputText]      = useState('')
+  const [status,         setStatus]         = useState('idle')
+  // status: idle | recording | transcribing | thinking | speaking
+  const [error,          setError]          = useState('')
+  const [isEnding,       setIsEnding]       = useState(false)
+  const [muteAI,         setMuteAI]         = useState(false)
+  const [interviewDone,  setInterviewDone]  = useState(false)
+  const [showEndConfirm, setShowEndConfirm] = useState(false)
+
+  const scrollRef   = useRef(null)
+  const textareaRef = useRef(null)
+
+  const recorder = useAudioRecorder()
+  const player   = useAudioPlayer()   // now uses Web Speech API
+
+  /* â”€â”€ Play AI text via Web Speech API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+  const speakAI = useCallback(async (text, audioBase64, mimeType) => {
+    if (muteAI) return
+    setStatus('speaking')
+    try {
+      // If backend sent real audio bytes, play those; otherwise use browser TTS
+      if (audioBase64 && audioBase64.length > 20) {
+        await player.playBase64Audio(audioBase64, mimeType || 'audio/mpeg')
+      } else {
+        await player.speak(text)      // â† Free Web Speech API
+      }
+    } catch { /* ignore audio errors */ }
+    finally { setStatus('idle') }
+  }, [muteAI, player])
+
+  /* â”€â”€ On mount: play opening message â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+  useEffect(() => {
+    if (!startData) { navigate('/dashboard'); return }
+    setTranscript([{ speaker: 'AI', content: startData.aiMessage }])
+    speakAI(startData.aiMessage, startData.audioBase64, startData.mimeType)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  /* â”€â”€ Auto-scroll â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+  useEffect(() => {
+    if (scrollRef.current)
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight
+  }, [transcript])
+
+  /* â”€â”€ Submit user text response â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+  const submitResponse = useCallback(async (content) => {
+    if (!content.trim() || status !== 'idle') return
+    setError('')
+    setInputText('')
+    setTranscript(prev => [...prev, { speaker: 'USER', content: content.trim() }])
+    setStatus('thinking')
+
+    try {
+      const { data } = await interviewService.respond(id, content.trim())
+      setTranscript(prev => [...prev, { speaker: 'AI', content: data.aiMessage }])
+      if (data.isLastQuestion) setInterviewDone(true)
+      await speakAI(data.aiMessage, data.audioBase64, data.mimeType)
+    } catch (err) {
+      setError(err.response?.data?.error || 'Something went wrong. Please try again.')
+      setStatus('idle')
+    }
+  }, [id, status, speakAI])
+
+  /* â”€â”€ Start mic recording â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+  const startRecording = async () => {
+    if (status !== 'idle') return
+    player.stop()
+    await recorder.startRecording()
+    setStatus('recording')
+  }
+
+  /* â”€â”€ Stop mic â†’ Groq Whisper STT â†’ submit â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+  const stopAndTranscribe = async () => {
+    setStatus('transcribing')
+    const blob = await recorder.stopRecording()
+    if (!blob || blob.size < 500) {
+      setStatus('idle')
+      setError('Recording too short â€” please try again.')
+      return
+    }
+    try {
+      const { data } = await interviewService.transcribeAudio(id, blob)
+      const text = data.transcript?.trim()
+      if (!text) { setStatus('idle'); setError('Could not transcribe. Try typing instead.'); return }
+      setInputText(text)
+      setStatus('idle')
+      await submitResponse(text)
+    } catch (err) {
+      setError('Transcription failed. Please type your answer.')
+      setStatus('idle')
+    }
+  }
+
+  /* â”€â”€ End interview â†’ get evaluation â†’ navigate to report â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+  const endInterview = async () => {
+    setIsEnding(true)
+    player.stop()
+    try {
+      const { data } = await interviewService.end(id)
+      navigate(`/interview/${id}/report`, { state: { evaluation: data } })
+    } catch (err) {
+      setError('Failed to generate report. Please try again.')
+      setIsEnding(false)
+    }
+  }
+
+  const isBusy = status !== 'idle'
+
+  const STATUS_LABEL = {
+    idle:         'Your turn',
+    recording:    'Listeningâ€¦',
+    transcribing: 'Transcribingâ€¦',
+    thinking:     'Alex is thinkingâ€¦',
+    speaking:     'Alex is speakingâ€¦',
+  }
+
+  return (
+    <div className="min-h-screen bg-surface-950 flex flex-col">
+      <div className="fixed inset-0 pointer-events-none overflow-hidden">
+        <div className="absolute top-0 left-1/2 -translate-x-1/2 w-[800px] h-[300px] bg-brand-900/15 rounded-full blur-3xl" />
+      </div>
+
+      {/* â”€â”€ Header â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
+      <header className="relative z-20 border-b border-white/5 px-4 py-3 flex items-center justify-between glass">
+        <div className="flex items-center gap-3">
+          <div className={`w-9 h-9 rounded-full flex items-center justify-center transition-all ${
+            status === 'speaking' ? 'bg-brand-600 glow-brand' : 'bg-brand-600/20'
+          }`}>
+            <Bot className="w-4 h-4 text-brand-300" />
+          </div>
+          <div>
+            <p className="text-white font-semibold text-sm leading-none">Alex</p>
+            <p className="text-white/40 text-xs mt-0.5">Senior Technical Interviewer</p>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-2">
+          {/* Status pill */}
+          <div className={`hidden sm:flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium transition-all ${
+            status === 'recording'
+              ? 'bg-red-500/20 text-red-400 border border-red-500/30'
+              : status === 'speaking'
+              ? 'bg-brand-500/20 text-brand-400 border border-brand-500/30'
+              : status === 'thinking' || status === 'transcribing'
+              ? 'bg-yellow-500/20 text-yellow-400 border border-yellow-500/30'
+              : 'bg-white/5 text-white/40 border border-white/10'
+          }`}>
+            {(status === 'thinking' || status === 'transcribing') && <Loader2 className="w-3 h-3 animate-spin" />}
+            {status === 'recording' && <span className="w-2 h-2 bg-red-400 rounded-full animate-pulse" />}
+            {status === 'speaking'  && <Waveform active />}
+            <span>{STATUS_LABEL[status]}</span>
+          </div>
+
+          {/* Mute toggle */}
+          <button onClick={() => { setMuteAI(m => !m); player.stop() }}
+            title={muteAI ? 'Unmute AI voice' : 'Mute AI voice'}
+            className={`p-2 rounded-xl border transition-all ${
+              muteAI ? 'border-white/20 text-white/40' : 'border-brand-500/30 text-brand-400'
+            }`}>
+            {muteAI ? <VolumeX className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
+          </button>
+
+          {/* End button */}
+          <button onClick={() => setShowEndConfirm(true)} disabled={isEnding}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-red-500/30 text-red-400 hover:bg-red-500/10 transition-all text-sm">
+            <StopCircle className="w-4 h-4" />
+            <span className="hidden sm:block">End</span>
+          </button>
+        </div>
+      </header>
+
+      {/* â”€â”€ Transcript â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
+      <div ref={scrollRef}
+        className="relative z-10 flex-1 overflow-y-auto px-4 py-6 space-y-4 max-w-3xl w-full mx-auto">
+
+        {transcript.map((msg, i) => <Bubble key={i} msg={msg} />)}
+
+        {/* Thinking indicator */}
+        {status === 'thinking' && (
+          <div className="flex gap-3">
+            <div className="w-8 h-8 rounded-full bg-brand-600/30 flex items-center justify-center shrink-0">
+              <Bot className="w-4 h-4 text-brand-400" />
+            </div>
+            <div className="bg-surface-700 rounded-2xl rounded-tl-sm px-4 py-3 flex items-center gap-1">
+              {[0,1,2].map(i => (
+                <span key={i} className="w-2 h-2 bg-white/40 rounded-full animate-bounce"
+                  style={{ animationDelay: `${i * 0.15}s` }} />
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Done banner */}
+        {interviewDone && (
+          <div className="glass border border-brand-500/30 rounded-2xl p-5 text-center">
+            <p className="text-brand-400 font-semibold mb-1">Interview Complete ðŸŽ‰</p>
+            <p className="text-white/50 text-sm mb-4">Generate your evaluation report now.</p>
+            <button onClick={endInterview} disabled={isEnding}
+              className="bg-brand-600 hover:bg-brand-500 text-white font-semibold px-6 py-2.5 rounded-xl transition-colors flex items-center gap-2 mx-auto">
+              {isEnding ? <><Loader2 className="w-4 h-4 animate-spin" /> Generatingâ€¦</> : 'Generate Report'}
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* â”€â”€ Input area â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
+      {!interviewDone && (
+        <div className="relative z-20 border-t border-white/5 glass px-4 py-4">
+          {error && (
+            <div className="flex items-center gap-2 mb-3 text-red-400 text-sm max-w-3xl mx-auto">
+              <AlertCircle className="w-4 h-4 shrink-0" />{error}
+            </div>
+          )}
+          <div className="max-w-3xl mx-auto flex items-end gap-3">
+            <textarea
+              ref={textareaRef}
+              value={inputText}
+              onChange={e => setInputText(e.target.value)}
+              onKeyDown={e => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault()
+                  if (inputText.trim() && !isBusy) submitResponse(inputText)
+                }
+              }}
+              placeholder={
+                status === 'recording'    ? 'ðŸŽ™  Listening â€” click â–  when doneâ€¦' :
+                status === 'transcribing' ? 'Transcribing your audioâ€¦' :
+                status === 'thinking'     ? 'Alex is thinkingâ€¦' :
+                status === 'speaking'     ? 'Alex is speakingâ€¦' :
+                'Type your answer, or use the micâ€¦  (Enter to send)'
+              }
+              disabled={isBusy && status !== 'idle'}
+              rows={2}
+              className="flex-1 bg-surface-800 border border-white/10 rounded-xl px-4 py-3 text-white placeholder-white/30 focus:outline-none focus:border-brand-500 transition-colors resize-none text-sm leading-relaxed disabled:opacity-50"
+            />
+
+            {/* Mic button */}
+            <button
+              onClick={status === 'recording' ? stopAndTranscribe : startRecording}
+              disabled={isBusy && status !== 'recording'}
+              title={status === 'recording' ? 'Stop recording' : 'Start recording'}
+              className={`p-3 rounded-xl border transition-all shrink-0 ${
+                status === 'recording'
+                  ? 'bg-red-500 border-red-500 text-white animate-pulse'
+                  : 'border-white/20 text-white/50 hover:border-brand-500/50 hover:text-brand-400 disabled:opacity-30'
+              }`}>
+              {status === 'recording' ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
+            </button>
+
+            {/* Send button */}
+            <button
+              onClick={() => submitResponse(inputText)}
+              disabled={!inputText.trim() || isBusy}
+              className="p-3 rounded-xl bg-brand-600 hover:bg-brand-500 disabled:opacity-30 text-white transition-all shrink-0">
+              <Send className="w-5 h-5" />
+            </button>
+          </div>
+          <p className="text-center text-white/20 text-xs mt-2">
+            <kbd className="px-1.5 py-0.5 bg-white/5 rounded font-mono text-xs">Enter</kbd> to send &nbsp;Â·&nbsp;
+            <kbd className="px-1.5 py-0.5 bg-white/5 rounded font-mono text-xs">Shift+Enter</kbd> for new line &nbsp;Â·&nbsp;
+            ðŸŽ™ voice powered by Groq Whisper &nbsp;Â·&nbsp; ðŸ”Š voice by browser
+          </p>
+        </div>
+      )}
+
+      {/* â”€â”€ End confirm modal â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
+      {showEndConfirm && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+          <div className="glass rounded-2xl p-6 w-full max-w-sm">
+            <h3 className="font-display text-lg font-bold text-white mb-2">End interview?</h3>
+            <p className="text-white/50 text-sm mb-6">
+              This will stop the session and generate your full evaluation report.
+            </p>
+            <div className="flex gap-3">
+              <button onClick={() => setShowEndConfirm(false)}
+                className="flex-1 px-4 py-2.5 border border-white/10 text-white/60 rounded-xl hover:border-white/20 transition-colors text-sm">
+                Continue
+              </button>
+              <button onClick={() => { setShowEndConfirm(false); endInterview() }} disabled={isEnding}
+                className="flex-1 px-4 py-2.5 bg-red-500 hover:bg-red-400 text-white rounded-xl transition-colors text-sm font-semibold flex items-center justify-center gap-2">
+                {isEnding ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+                End & Evaluate
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+
+
+================================================
+FILE: LoginPage.jsx
+================================================
+import { useState } from 'react'
+import { Link, useNavigate } from 'react-router-dom'
+import { useAuth } from '../context/AuthContext'
+import { Eye, EyeOff, Zap, AlertCircle } from 'lucide-react'
+
+export default function LoginPage() {
+  const { login } = useAuth()
+  const navigate  = useNavigate()
+  const [form, setForm]     = useState({ email: '', password: '' })
+  const [showPw, setShowPw] = useState(false)
+  const [loading, setLoading] = useState(false)
+  const [error, setError]     = useState('')
+
+  const handle = e => setForm(p => ({ ...p, [e.target.name]: e.target.value }))
+
+  const submit = async e => {
+    e.preventDefault()
+    setError(''); setLoading(true)
+    try {
+      await login(form.email, form.password)
+      navigate('/dashboard')
+    } catch (err) {
+      setError(err.response?.data?.error || 'Invalid credentials')
+    } finally { setLoading(false) }
+  }
+
+  return (
+    <div className="min-h-screen bg-surface-950 flex items-center justify-center p-4">
+      {/* Background glow */}
+      <div className="fixed inset-0 overflow-hidden pointer-events-none">
+        <div className="absolute top-1/4 left-1/2 -translate-x-1/2 w-[600px] h-[600px] bg-brand-600/10 rounded-full blur-3xl" />
+      </div>
+
+      <div className="w-full max-w-md relative z-10">
+        {/* Logo */}
+        <div className="text-center mb-10">
+          <div className="inline-flex items-center gap-2 mb-4">
+            <div className="w-10 h-10 bg-brand-600 rounded-xl flex items-center justify-center glow-brand">
+              <Zap className="w-5 h-5 text-white" />
+            </div>
+            <span className="font-display text-2xl font-bold text-white">iPrep</span>
+          </div>
+          <h1 className="text-3xl font-display font-bold text-white mb-2">Welcome back</h1>
+          <p className="text-white/50">Sign in to continue your interview prep</p>
+        </div>
+
+        <form onSubmit={submit} className="glass rounded-2xl p-8 space-y-5">
+          {error && (
+            <div className="flex items-center gap-2 p-3 bg-red-500/10 border border-red-500/30 rounded-xl text-red-400 text-sm">
+              <AlertCircle className="w-4 h-4 shrink-0" />{error}
+            </div>
+          )}
+
+          <div className="space-y-1">
+            <label className="text-sm text-white/60 font-medium">Email</label>
+            <input
+              type="email" name="email" value={form.email} onChange={handle} required
+              placeholder="you@example.com"
+              className="w-full bg-surface-800 border border-white/10 rounded-xl px-4 py-3 text-white placeholder-white/30 focus:outline-none focus:border-brand-500 transition-colors"
+            />
+          </div>
+
+          <div className="space-y-1">
+            <label className="text-sm text-white/60 font-medium">Password</label>
+            <div className="relative">
+              <input
+                type={showPw ? 'text' : 'password'} name="password" value={form.password}
+                onChange={handle} required placeholder="â€¢â€¢â€¢â€¢â€¢â€¢â€¢â€¢"
+                className="w-full bg-surface-800 border border-white/10 rounded-xl px-4 py-3 pr-12 text-white placeholder-white/30 focus:outline-none focus:border-brand-500 transition-colors"
+              />
+              <button type="button" onClick={() => setShowPw(p => !p)}
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-white/40 hover:text-white/70 transition-colors">
+                {showPw ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
+              </button>
+            </div>
+          </div>
+
+          <button type="submit" disabled={loading}
+            className="w-full bg-brand-600 hover:bg-brand-500 disabled:opacity-50 text-white font-semibold py-3 rounded-xl transition-all duration-200 flex items-center justify-center gap-2 glow-brand">
+            {loading ? <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" /> : 'Sign In'}
+          </button>
+
+          <p className="text-center text-white/50 text-sm">
+            No account?{' '}
+            <Link to="/register" className="text-brand-400 hover:text-brand-300 font-medium transition-colors">
+              Create one
+            </Link>
+          </p>
+        </form>
+      </div>
+    </div>
+  )
+}
+
+
+
+================================================
+FILE: NewInterviewPage.jsx
+================================================
+import { useState } from 'react'
+import { useNavigate } from 'react-router-dom'
+import { interviewService } from '../services/interviewService'
+import { Zap, ArrowLeft, ArrowRight, Briefcase, GraduationCap, Target } from 'lucide-react'
+
+const ROLES = [
+  "Java Full Stack Developer","Frontend Developer","Backend Developer",
+  "React Developer","Spring Boot Engineer","DevOps Engineer",
+  "Data Engineer","Machine Learning Engineer","Software Engineer",
+  "System Design Architect"
+]
+
+const LEVELS    = ["FRESHER","MID","SENIOR"]
+const DIFFS     = ["EASY","MEDIUM","HARD"]
+const Q_COUNTS  = [3, 5, 7, 10]
+
+const LEVEL_DESC = {
+  FRESHER: "0â€“2 years experience",
+  MID:     "2â€“5 years experience",
+  SENIOR:  "5+ years experience",
+}
+const DIFF_DESC = {
+  EASY:   "Conceptual & fundamentals",
+  MEDIUM: "Applied & problem-solving",
+  HARD:   "Advanced & system design",
+}
+
+export default function NewInterviewPage() {
+  const navigate = useNavigate()
+  const [step, setStep] = useState(0)
+  const [form, setForm] = useState({
+    targetRole: 'Java Full Stack Developer',
+    experienceLevel: 'MID',
+    difficulty: 'MEDIUM',
+    questionCount: 5,
+  })
+  const [customRole, setCustomRole] = useState('')
+  const [loading, setLoading] = useState(false)
+  const [error, setError]     = useState('')
+
+  const set = (k, v) => setForm(p => ({ ...p, [k]: v }))
+
+  const start = async () => {
+    setLoading(true); setError('')
+    const role = form.targetRole === '__custom__' ? customRole : form.targetRole
+    try {
+      const { data } = await interviewService.start(
+        role, form.experienceLevel, form.difficulty, form.questionCount)
+      navigate(`/interview/${data.interviewId}/live`, { state: { startData: data } })
+    } catch (err) {
+      setError(err.response?.data?.error || 'Failed to start interview')
+      setLoading(false)
+    }
+  }
+
+  const steps = [
+    {
+      icon: Briefcase,
+      title: "Choose your role",
+      content: (
+        <div className="space-y-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            {ROLES.map(r => (
+              <button key={r} onClick={() => set('targetRole', r)}
+                className={`text-left px-4 py-3 rounded-xl border text-sm font-medium transition-all duration-150 ${
+                  form.targetRole === r
+                    ? 'border-brand-500 bg-brand-500/10 text-white'
+                    : 'border-white/10 bg-white/3 text-white/60 hover:border-white/20 hover:text-white/80'
+                }`}>{r}
+              </button>
+            ))}
+            <button onClick={() => set('targetRole', '__custom__')}
+              className={`text-left px-4 py-3 rounded-xl border text-sm font-medium transition-all duration-150 ${
+                form.targetRole === '__custom__'
+                  ? 'border-brand-500 bg-brand-500/10 text-white'
+                  : 'border-white/10 bg-white/3 text-white/60 hover:border-white/20'
+              }`}>Custom roleâ€¦</button>
+          </div>
+          {form.targetRole === '__custom__' && (
+            <input value={customRole} onChange={e => setCustomRole(e.target.value)}
+              placeholder="e.g. iOS Developer"
+              className="w-full bg-surface-800 border border-brand-500/50 rounded-xl px-4 py-3 text-white placeholder-white/30 focus:outline-none focus:border-brand-500"
+            />
+          )}
+        </div>
+      )
+    },
+    {
+      icon: GraduationCap,
+      title: "Experience & difficulty",
+      content: (
+        <div className="space-y-6">
+          <div>
+            <p className="text-white/50 text-sm mb-3 font-medium">Experience Level</p>
+            <div className="grid grid-cols-3 gap-3">
+              {LEVELS.map(l => (
+                <button key={l} onClick={() => set('experienceLevel', l)}
+                  className={`p-4 rounded-xl border text-center transition-all duration-150 ${
+                    form.experienceLevel === l
+                      ? 'border-brand-500 bg-brand-500/10'
+                      : 'border-white/10 bg-white/3 hover:border-white/20'
+                  }`}>
+                  <p className="font-semibold text-white text-sm">{l}</p>
+                  <p className="text-xs text-white/40 mt-1">{LEVEL_DESC[l]}</p>
+                </button>
+              ))}
+            </div>
+          </div>
+          <div>
+            <p className="text-white/50 text-sm mb-3 font-medium">Difficulty</p>
+            <div className="grid grid-cols-3 gap-3">
+              {DIFFS.map(d => (
+                <button key={d} onClick={() => set('difficulty', d)}
+                  className={`p-4 rounded-xl border text-center transition-all duration-150 ${
+                    form.difficulty === d
+                      ? 'border-brand-500 bg-brand-500/10'
+                      : 'border-white/10 bg-white/3 hover:border-white/20'
+                  }`}>
+                  <p className="font-semibold text-white text-sm">{d}</p>
+                  <p className="text-xs text-white/40 mt-1">{DIFF_DESC[d]}</p>
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      )
+    },
+    {
+      icon: Target,
+      title: "Number of questions",
+      content: (
+        <div className="space-y-3">
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            {Q_COUNTS.map(n => (
+              <button key={n} onClick={() => set('questionCount', n)}
+                className={`p-6 rounded-xl border text-center transition-all duration-150 ${
+                  form.questionCount === n
+                    ? 'border-brand-500 bg-brand-500/10 glow-brand'
+                    : 'border-white/10 bg-white/3 hover:border-white/20'
+                }`}>
+                <p className="text-3xl font-display font-bold text-white">{n}</p>
+                <p className="text-xs text-white/40 mt-1">
+                  {n <= 3 ? 'Quick' : n <= 5 ? 'Standard' : n <= 7 ? 'Thorough' : 'Full'}
+                </p>
+              </button>
+            ))}
+          </div>
+          {/* Summary */}
+          <div className="mt-6 glass-light rounded-xl p-4 space-y-2">
+            <p className="text-white/50 text-xs font-medium uppercase tracking-wider">Summary</p>
+            <p className="text-white font-semibold">
+              {form.targetRole === '__custom__' ? (customRole || 'Custom Role') : form.targetRole}
+            </p>
+            <p className="text-white/60 text-sm">
+              {form.experienceLevel} Â· {form.difficulty} Â· {form.questionCount} questions
+            </p>
+          </div>
+        </div>
+      )
+    }
+  ]
+
+  const currentStep = steps[step]
+  const Icon = currentStep.icon
+  const canNext = step < steps.length - 1
+  const isLast  = step === steps.length - 1
+  const roleOk  = form.targetRole !== '__custom__' || customRole.trim().length > 1
+
+  return (
+    <div className="min-h-screen bg-surface-950 flex flex-col items-center justify-center p-4">
+      <div className="fixed inset-0 pointer-events-none overflow-hidden">
+        <div className="absolute top-1/4 right-1/4 w-96 h-96 bg-brand-600/6 rounded-full blur-3xl" />
+      </div>
+
+      <div className="w-full max-w-2xl relative z-10">
+        {/* Back */}
+        <button onClick={() => step === 0 ? navigate('/dashboard') : setStep(s => s - 1)}
+          className="flex items-center gap-1.5 text-white/40 hover:text-white/70 transition-colors mb-8 text-sm">
+          <ArrowLeft className="w-4 h-4" /> {step === 0 ? 'Dashboard' : 'Back'}
+        </button>
+
+        {/* Progress */}
+        <div className="flex items-center gap-2 mb-8">
+          {steps.map((_, i) => (
+            <div key={i} className={`h-1 flex-1 rounded-full transition-all duration-300 ${
+              i <= step ? 'bg-brand-500' : 'bg-white/10'}`} />
+          ))}
+        </div>
+
+        <div className="glass rounded-2xl p-8">
+          <div className="flex items-center gap-3 mb-6">
+            <div className="w-10 h-10 bg-brand-600/20 rounded-xl flex items-center justify-center">
+              <Icon className="w-5 h-5 text-brand-400" />
+            </div>
+            <h2 className="font-display text-2xl font-bold text-white">{currentStep.title}</h2>
+          </div>
+
+          {currentStep.content}
+
+          {error && (
+            <p className="mt-4 text-red-400 text-sm">{error}</p>
+          )}
+
+          <div className="flex justify-end mt-8">
+            {canNext ? (
+              <button onClick={() => setStep(s => s + 1)} disabled={!roleOk}
+                className="flex items-center gap-2 bg-brand-600 hover:bg-brand-500 disabled:opacity-40 text-white font-semibold px-6 py-2.5 rounded-xl transition-colors">
+                Continue <ArrowRight className="w-4 h-4" />
+              </button>
+            ) : (
+              <button onClick={start} disabled={loading || !roleOk}
+                className="flex items-center gap-2 bg-brand-600 hover:bg-brand-500 disabled:opacity-40 text-white font-semibold px-6 py-2.5 rounded-xl transition-all glow-brand">
+                {loading
+                  ? <><div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" /> Preparingâ€¦</>
+                  : <><Zap className="w-4 h-4" /> Start Interview</>}
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+
+
+================================================
+FILE: RegisterPage.jsx
+================================================
+import { useState } from 'react'
+import { Link, useNavigate } from 'react-router-dom'
+import { useAuth } from '../context/AuthContext'
+import { Eye, EyeOff, Zap, AlertCircle } from 'lucide-react'
+
+export default function RegisterPage() {
+  const { register } = useAuth()
+  const navigate = useNavigate()
+  const [form, setForm]   = useState({ fullName: '', email: '', password: '' })
+  const [showPw, setShowPw] = useState(false)
+  const [loading, setLoading] = useState(false)
+  const [error, setError]   = useState('')
+
+  const handle = e => setForm(p => ({ ...p, [e.target.name]: e.target.value }))
+
+  const submit = async e => {
+    e.preventDefault()
+    setError(''); setLoading(true)
+    try {
+      await register(form.fullName, form.email, form.password)
+      navigate('/dashboard')
+    } catch (err) {
+      setError(err.response?.data?.error || 'Registration failed')
+    } finally { setLoading(false) }
+  }
+
+  return (
+    <div className="min-h-screen bg-surface-950 flex items-center justify-center p-4">
+      <div className="fixed inset-0 overflow-hidden pointer-events-none">
+        <div className="absolute top-1/4 left-1/2 -translate-x-1/2 w-[600px] h-[600px] bg-brand-600/10 rounded-full blur-3xl" />
+      </div>
+
+      <div className="w-full max-w-md relative z-10">
+        <div className="text-center mb-10">
+          <div className="inline-flex items-center gap-2 mb-4">
+            <div className="w-10 h-10 bg-brand-600 rounded-xl flex items-center justify-center glow-brand">
+              <Zap className="w-5 h-5 text-white" />
+            </div>
+            <span className="font-display text-2xl font-bold text-white">iPrep</span>
+          </div>
+          <h1 className="text-3xl font-display font-bold text-white mb-2">Start preparing</h1>
+          <p className="text-white/50">Create your account to begin</p>
+        </div>
+
+        <form onSubmit={submit} className="glass rounded-2xl p-8 space-y-5">
+          {error && (
+            <div className="flex items-center gap-2 p-3 bg-red-500/10 border border-red-500/30 rounded-xl text-red-400 text-sm">
+              <AlertCircle className="w-4 h-4 shrink-0" />{error}
+            </div>
+          )}
+
+          {[
+            { label: 'Full Name', name: 'fullName', type: 'text', placeholder: 'Jane Smith' },
+            { label: 'Email', name: 'email', type: 'email', placeholder: 'you@example.com' },
+          ].map(f => (
+            <div key={f.name} className="space-y-1">
+              <label className="text-sm text-white/60 font-medium">{f.label}</label>
+              <input type={f.type} name={f.name} value={form[f.name]} onChange={handle}
+                required placeholder={f.placeholder}
+                className="w-full bg-surface-800 border border-white/10 rounded-xl px-4 py-3 text-white placeholder-white/30 focus:outline-none focus:border-brand-500 transition-colors"
+              />
+            </div>
+          ))}
+
+          <div className="space-y-1">
+            <label className="text-sm text-white/60 font-medium">Password</label>
+            <div className="relative">
+              <input type={showPw ? 'text' : 'password'} name="password" value={form.password}
+                onChange={handle} required placeholder="Min. 8 characters" minLength={8}
+                className="w-full bg-surface-800 border border-white/10 rounded-xl px-4 py-3 pr-12 text-white placeholder-white/30 focus:outline-none focus:border-brand-500 transition-colors"
+              />
+              <button type="button" onClick={() => setShowPw(p => !p)}
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-white/40 hover:text-white/70 transition-colors">
+                {showPw ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
+              </button>
+            </div>
+          </div>
+
+          <button type="submit" disabled={loading}
+            className="w-full bg-brand-600 hover:bg-brand-500 disabled:opacity-50 text-white font-semibold py-3 rounded-xl transition-all duration-200 flex items-center justify-center gap-2 glow-brand">
+            {loading ? <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" /> : 'Create Account'}
+          </button>
+
+          <p className="text-center text-white/50 text-sm">
+            Already have an account?{' '}
+            <Link to="/login" className="text-brand-400 hover:text-brand-300 font-medium transition-colors">Sign in</Link>
+          </p>
+        </form>
+      </div>
+    </div>
+  )
+}
+
+
+
+================================================
+FILE: ReportPage.jsx
+================================================
+import { useParams, useLocation, useNavigate } from 'react-router-dom'
+import { useEffect, useState } from 'react'
+import { interviewService } from '../services/interviewService'
+import {
+  Award, TrendingUp, AlertTriangle, CheckCircle, XCircle,
+  BookOpen, ArrowLeft, RotateCcw, ChevronDown, ChevronUp,
+  Zap, BarChart2, MessageSquare, Brain
+} from 'lucide-react'
+
+const VERDICT = {
+  READY_FOR_PLACEMENT: {
+    label:   'Ready for Placement',
+    icon:    CheckCircle,
+    color:   'text-emerald-400',
+    bg:      'bg-emerald-500/10 border-emerald-500/30',
+    glow:    '0 0 40px rgba(16,185,129,0.2)',
+  },
+  BORDERLINE: {
+    label:   'Borderline',
+    icon:    AlertTriangle,
+    color:   'text-yellow-400',
+    bg:      'bg-yellow-500/10 border-yellow-500/30',
+    glow:    '0 0 40px rgba(234,179,8,0.2)',
+  },
+  NEEDS_MORE_PRACTICE: {
+    label:   'Needs More Practice',
+    icon:    XCircle,
+    color:   'text-red-400',
+    bg:      'bg-red-500/10 border-red-500/30',
+    glow:    '0 0 40px rgba(239,68,68,0.2)',
+  },
+}
+
+function ScoreBar({ label, score, icon: Icon, color }) {
+  const pct = Math.min((score / 10) * 100, 100)
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2 text-sm text-white/60">
+          <Icon className={`w-4 h-4 ${color}`} />
+          {label}
+        </div>
+        <span className="font-display font-bold text-white text-sm">{score?.toFixed(1)}</span>
+      </div>
+      <div className="h-2 bg-white/5 rounded-full overflow-hidden">
+        <div
+          className="h-full rounded-full transition-all duration-1000 ease-out"
+          style={{
+            width: `${pct}%`,
+            background: score >= 7 ? '#10b981' : score >= 5 ? '#f59e0b' : '#ef4444',
+          }}
+        />
+      </div>
+    </div>
+  )
+}
+
+function TranscriptSection({ transcript }) {
+  const [open, setOpen] = useState(false)
+  if (!transcript?.length) return null
+  return (
+    <div className="glass rounded-2xl overflow-hidden">
+      <button onClick={() => setOpen(o => !o)}
+        className="w-full px-6 py-4 flex items-center justify-between text-left hover:bg-white/2 transition-colors">
+        <div className="flex items-center gap-2">
+          <MessageSquare className="w-4 h-4 text-brand-400" />
+          <span className="font-semibold text-white">Full Transcript</span>
+          <span className="text-white/30 text-sm">({transcript.length} messages)</span>
+        </div>
+        {open ? <ChevronUp className="w-4 h-4 text-white/40" /> : <ChevronDown className="w-4 h-4 text-white/40" />}
+      </button>
+      {open && (
+        <div className="border-t border-white/5 px-6 py-4 space-y-3 max-h-96 overflow-y-auto">
+          {transcript.map((msg, i) => (
+            <div key={i} className={`flex gap-2 ${msg.speaker === 'USER' ? 'flex-row-reverse' : ''}`}>
+              <span className={`text-xs px-2 py-0.5 rounded-full shrink-0 mt-1 ${
+                msg.speaker === 'AI'
+                  ? 'bg-brand-500/20 text-brand-400'
+                  : 'bg-white/10 text-white/50'
+              }`}>{msg.speaker === 'AI' ? 'Alex' : 'You'}</span>
+              <p className={`text-sm leading-relaxed rounded-xl px-3 py-2 ${
+                msg.speaker === 'AI'
+                  ? 'bg-surface-700 text-white/80'
+                  : 'bg-brand-600/10 text-white/80'
+              }`}>{msg.content}</p>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+export default function ReportPage() {
+  const { id }      = useParams()
+  const location    = useLocation()
+  const navigate    = useNavigate()
+  const [data, setData]       = useState(location.state?.evaluation || null)
+  const [detail, setDetail]   = useState(null)
+  const [loading, setLoading] = useState(!data)
+
+  useEffect(() => {
+    // Load full interview detail (for transcript + evaluation if not in state)
+    interviewService.getDetail(id)
+      .then(r => {
+        setDetail(r.data)
+        if (!data && r.data.evaluation) setData(r.data.evaluation)
+      })
+      .catch(console.error)
+      .finally(() => setLoading(false))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id])
+
+  if (loading) return (
+    <div className="min-h-screen bg-surface-950 flex items-center justify-center">
+      <div className="text-center">
+        <div className="w-12 h-12 border-2 border-brand-500 border-t-transparent rounded-full animate-spin mx-auto mb-4" />
+        <p className="text-white/50">Generating your reportâ€¦</p>
+      </div>
+    </div>
+  )
+
+  if (!data) return (
+    <div className="min-h-screen bg-surface-950 flex items-center justify-center">
+      <div className="text-center">
+        <p className="text-white/50 mb-4">Report not found.</p>
+        <button onClick={() => navigate('/dashboard')}
+          className="text-brand-400 hover:text-brand-300">â† Back to Dashboard</button>
+      </div>
+    </div>
+  )
+
+  const verdict = VERDICT[data.verdict] || VERDICT['BORDERLINE']
+  const VIcon   = verdict.icon
+  const scores  = [
+    { label: 'Technical',        score: data.technicalScore,       icon: Brain,    color: 'text-brand-400'   },
+    { label: 'Communication',    score: data.communicationScore,   icon: MessageSquare, color: 'text-purple-400' },
+    { label: 'Problem Solving',  score: data.problemSolvingScore,  icon: TrendingUp, color: 'text-cyan-400'  },
+    { label: 'Depth of Knowledge', score: data.depthScore,         icon: BarChart2, color: 'text-pink-400'  },
+  ]
+
+  return (
+    <div className="min-h-screen bg-surface-950">
+      {/* Background */}
+      <div className="fixed inset-0 pointer-events-none overflow-hidden">
+        <div className="absolute top-0 left-1/2 -translate-x-1/2 w-[700px] h-[500px] bg-brand-900/15 rounded-full blur-3xl" />
+      </div>
+
+      <div className="relative z-10 max-w-3xl mx-auto px-4 py-10">
+        {/* Back */}
+        <button onClick={() => navigate('/dashboard')}
+          className="flex items-center gap-1.5 text-white/40 hover:text-white/70 transition-colors mb-8 text-sm">
+          <ArrowLeft className="w-4 h-4" /> Dashboard
+        </button>
+
+        {/* Verdict Card */}
+        <div className={`glass rounded-3xl p-8 mb-6 border text-center ${verdict.bg}`}
+          style={{ boxShadow: verdict.glow }}>
+          <div className={`inline-flex w-16 h-16 rounded-2xl items-center justify-center mb-4 ${verdict.bg}`}>
+            <VIcon className={`w-8 h-8 ${verdict.color}`} />
+          </div>
+          <h1 className="font-display text-3xl font-bold text-white mb-1">
+            {data.verdictTitle || verdict.label}
+          </h1>
+          <p className="text-white/50 text-sm max-w-lg mx-auto leading-relaxed">
+            {data.verdictDescription}
+          </p>
+          {/* Overall Score */}
+          <div className="mt-6 inline-flex items-center gap-3 px-6 py-3 bg-white/5 rounded-2xl">
+            <Award className="w-5 h-5 text-yellow-400" />
+            <span className="text-white/60 text-sm">Overall Score</span>
+            <span className="font-display text-2xl font-bold text-white">
+              {data.overallScore?.toFixed(1)}
+              <span className="text-white/30 text-sm font-normal"> / 10</span>
+            </span>
+          </div>
+        </div>
+
+        {/* Score Breakdown */}
+        <div className="glass rounded-2xl p-6 mb-6">
+          <h2 className="font-display font-bold text-white mb-5 flex items-center gap-2">
+            <BarChart2 className="w-4 h-4 text-brand-400" /> Score Breakdown
+          </h2>
+          <div className="space-y-4">
+            {scores.map(s => (
+              <ScoreBar key={s.label} {...s} />
+            ))}
+          </div>
+        </div>
+
+        {/* Analysis */}
+        {data.correctnessAnalysis && (
+          <div className="glass rounded-2xl p-6 mb-6">
+            <h2 className="font-display font-bold text-white mb-3 flex items-center gap-2">
+              <Brain className="w-4 h-4 text-purple-400" /> Technical Analysis
+            </h2>
+            <p className="text-white/60 text-sm leading-relaxed">{data.correctnessAnalysis}</p>
+          </div>
+        )}
+
+        {/* Strengths & Improvements */}
+        <div className="grid sm:grid-cols-2 gap-4 mb-6">
+          {data.strengths?.length > 0 && (
+            <div className="glass rounded-2xl p-6">
+              <h2 className="font-display font-bold text-white mb-4 flex items-center gap-2">
+                <CheckCircle className="w-4 h-4 text-emerald-400" /> Strengths
+              </h2>
+              <ul className="space-y-2">
+                {data.strengths.map((s, i) => (
+                  <li key={i} className="flex items-start gap-2 text-sm text-white/60">
+                    <span className="w-1.5 h-1.5 bg-emerald-400 rounded-full mt-1.5 shrink-0" />
+                    {s}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {data.areasForImprovement?.length > 0 && (
+            <div className="glass rounded-2xl p-6">
+              <h2 className="font-display font-bold text-white mb-4 flex items-center gap-2">
+                <TrendingUp className="w-4 h-4 text-yellow-400" /> Areas to Improve
+              </h2>
+              <ul className="space-y-2">
+                {data.areasForImprovement.map((a, i) => (
+                  <li key={i} className="flex items-start gap-2 text-sm text-white/60">
+                    <span className="w-1.5 h-1.5 bg-yellow-400 rounded-full mt-1.5 shrink-0" />
+                    {a}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+
+        {/* Recommended Topics */}
+        {data.recommendedTopics?.length > 0 && (
+          <div className="glass rounded-2xl p-6 mb-6">
+            <h2 className="font-display font-bold text-white mb-4 flex items-center gap-2">
+              <BookOpen className="w-4 h-4 text-cyan-400" /> Recommended Topics
+            </h2>
+            <div className="flex flex-wrap gap-2">
+              {data.recommendedTopics.map((t, i) => (
+                <span key={i}
+                  className="px-3 py-1.5 bg-brand-500/10 border border-brand-500/20 rounded-full text-brand-300 text-sm">
+                  {t}
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Per-question scores */}
+        {data.questionScores?.length > 0 && (
+          <div className="glass rounded-2xl p-6 mb-6">
+            <h2 className="font-display font-bold text-white mb-4 flex items-center gap-2">
+              <Zap className="w-4 h-4 text-brand-400" /> Per-Question Breakdown
+            </h2>
+            <div className="space-y-3">
+              {data.questionScores.map(q => (
+                <div key={q.questionNumber} className="glass-light rounded-xl p-4">
+                  <div className="flex items-center justify-between mb-1.5">
+                    <span className="text-white/60 text-sm font-medium">Q{q.questionNumber}</span>
+                    <span className={`font-display font-bold text-sm ${
+                      q.score >= 7 ? 'text-emerald-400' :
+                      q.score >= 5 ? 'text-yellow-400' : 'text-red-400'
+                    }`}>{q.score}/10</span>
+                  </div>
+                  <p className="text-white/50 text-xs leading-relaxed">{q.feedback}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Transcript */}
+        {detail?.transcript && <TranscriptSection transcript={detail.transcript} />}
+
+        {/* Actions */}
+        <div className="flex gap-3 mt-8">
+          <button onClick={() => navigate('/interview/new')}
+            className="flex-1 flex items-center justify-center gap-2 bg-brand-600 hover:bg-brand-500 text-white font-semibold py-3 rounded-xl transition-colors glow-brand">
+            <RotateCcw className="w-4 h-4" /> Try Again
+          </button>
+          <button onClick={() => navigate('/dashboard')}
+            className="flex-1 flex items-center justify-center gap-2 glass border-white/10 text-white/70 hover:text-white py-3 rounded-xl transition-colors">
+            <ArrowLeft className="w-4 h-4" /> Dashboard
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+
+
+================================================
+FILE: api.js
+================================================
+import axios from 'axios'
+
+const api = axios.create({
+  baseURL: import.meta.env.VITE_API_BASE_URL || 'http://localhost:8080',
+  timeout: 60000,
+})
+
+api.interceptors.request.use(cfg => {
+  const token = localStorage.getItem('iprep_token')
+  if (token) cfg.headers.Authorization = `Bearer ${token}`
+  return cfg
+})
+
+api.interceptors.response.use(
+  res => res,
+  err => {
+    if (err.response?.status === 401) {
+      localStorage.removeItem('iprep_token')
+      localStorage.removeItem('iprep_user')
+      window.location.href = '/login'
+    }
+    return Promise.reject(err)
+  }
+)
+
+export default api
+
+
+
+================================================
+FILE: interviewService.js
+================================================
+import api from './api'
+const B = '/api/v1/interviews'
+export const interviewService = {
+  start: (targetRole, experienceLevel, difficulty, questionCount = 5) =>
+    api.post(B, { targetRole, experienceLevel, difficulty, questionCount }),
+  respond: (id, content) =>
+    api.post(`${B}/${id}/respond`, { content }),
+  transcribeAudio: (id, blob) => {
+    const fd = new FormData()
+    fd.append('audio', blob, 'recording.webm')
+    return api.post(`${B}/${id}/transcribe`, fd, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    })
+  },
+  end:       id => api.post(`${B}/${id}/end`),
+  list:      ()  => api.get(B),
+  getDetail: id  => api.get(`${B}/${id}`),
+}
+
+
+
+================================================
+FILE: App.jsx
+================================================
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
+import { AuthProvider, useAuth } from './context/AuthContext'
+import LoginPage    from './pages/LoginPage'
+import RegisterPage from './pages/RegisterPage'
+import DashboardPage from './pages/DashboardPage'
+import NewInterviewPage from './pages/NewInterviewPage'
+import LiveInterviewPage from './pages/LiveInterviewPage'
+import ReportPage   from './pages/ReportPage'
+
+function PrivateRoute({ children }) {
+  const { user, loading } = useAuth()
+  if (loading) return (
+    <div className="min-h-screen bg-surface-950 flex items-center justify-center">
+      <div className="w-8 h-8 border-2 border-brand-500 border-t-transparent rounded-full animate-spin" />
+    </div>
+  )
+  return user ? children : <Navigate to="/login" replace />
+}
+
+function PublicRoute({ children }) {
+  const { user, loading } = useAuth()
+  if (loading) return null
+  return user ? <Navigate to="/dashboard" replace /> : children
+}
+
+export default function App() {
+  return (
+    <AuthProvider>
+      <BrowserRouter>
+        <Routes>
+          <Route path="/" element={<Navigate to="/dashboard" replace />} />
+          <Route path="/login"    element={<PublicRoute><LoginPage /></PublicRoute>} />
+          <Route path="/register" element={<PublicRoute><RegisterPage /></PublicRoute>} />
+          <Route path="/dashboard" element={<PrivateRoute><DashboardPage /></PrivateRoute>} />
+          <Route path="/interview/new" element={<PrivateRoute><NewInterviewPage /></PrivateRoute>} />
+          <Route path="/interview/:id/live" element={<PrivateRoute><LiveInterviewPage /></PrivateRoute>} />
+          <Route path="/interview/:id/report" element={<PrivateRoute><ReportPage /></PrivateRoute>} />
+        </Routes>
+      </BrowserRouter>
+    </AuthProvider>
+  )
+}
+
+
+
+================================================
+FILE: index.css
+================================================
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+
+  body {
+    @apply bg-surface-950 text-white;
+    font-family: 'DM Sans', sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { @apply bg-surface-900; }
+  ::-webkit-scrollbar-thumb { @apply bg-surface-600 rounded-full; }
+  ::-webkit-scrollbar-thumb:hover { @apply bg-brand-500; }
+}
+
+@layer utilities {
+  .glass {
+    background: rgba(13, 13, 31, 0.7);
+    backdrop-filter: blur(20px);
+    border: 1px solid rgba(99, 102, 241, 0.15);
+  }
+  .glass-light {
+    background: rgba(255, 255, 255, 0.04);
+    backdrop-filter: blur(12px);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+  }
+  .text-gradient {
+    background: linear-gradient(135deg, #818cf8, #6366f1, #a78bfa);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+  .glow-brand {
+    box-shadow: 0 0 30px rgba(99, 102, 241, 0.3), 0 0 60px rgba(99, 102, 241, 0.1);
+  }
+}
+
+
+
+================================================
+FILE: main.jsx
+================================================
+import React from 'react'
+import ReactDOM from 'react-dom/client'
+import App from './App.jsx'
+import './index.css'
+
+ReactDOM.createRoot(document.getElementById('root')).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+)
+
+
+
+================================================
+FILE: postcss.config.js
+================================================
+export default {
+  plugins: { tailwindcss: {}, autoprefixer: {} },
+}
+
+
+
+================================================
+FILE: tailwind.config.js
+================================================
+/** @type {import('tailwindcss').Config} */
+export default {
+  content: ['./index.html', './src/**/*.{js,jsx,ts,tsx}'],
+  theme: {
+    extend: {
+      fontFamily: {
+        sans: ['DM Sans', 'sans-serif'],
+        mono: ['JetBrains Mono', 'monospace'],
+        display: ['Syne', 'sans-serif'],
+      },
+      colors: {
+        brand: {
+          50:  '#f0f4ff',
+          100: '#e0e9ff',
+          200: '#c7d6fe',
+          300: '#a5b9fc',
+          400: '#8093f9',
+          500: '#6366f1',
+          600: '#4f46e5',
+          700: '#4338ca',
+          800: '#3730a3',
+          900: '#312e81',
+        },
+        surface: {
+          950: '#060612',
+          900: '#0d0d1f',
+          800: '#13132b',
+          700: '#1a1a3a',
+          600: '#242452',
+        },
+      },
+      animation: {
+        'pulse-slow': 'pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite',
+        'waveform': 'waveform 1.2s ease-in-out infinite',
+        'float': 'float 6s ease-in-out infinite',
+        'glow': 'glow 2s ease-in-out infinite alternate',
+      },
+      keyframes: {
+        waveform: {
+          '0%, 100%': { transform: 'scaleY(0.3)' },
+          '50%': { transform: 'scaleY(1)' },
+        },
+        float: {
+          '0%, 100%': { transform: 'translateY(0px)' },
+          '50%': { transform: 'translateY(-10px)' },
+        },
+        glow: {
+          from: { boxShadow: '0 0 10px #6366f140' },
+          to:   { boxShadow: '0 0 30px #6366f180, 0 0 60px #6366f130' },
+        },
+      },
+    },
+  },
+  plugins: [],
+}
+
+
+
+================================================
+FILE: vite.config.js
+================================================
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+
+export default defineConfig({
+  plugins: [react()],
+  server: {
+    port: 5173,
+    proxy: {
+      '/api': {
+        target: 'http://localhost:8080',
+        changeOrigin: true,
+      }
+    }
+  }
+})
+
+
+
