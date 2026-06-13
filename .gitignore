@@ -1,2 +1,16 @@
-# Project exclude paths
-/iprep/backend/target/
+# Ignore the environment variables file (CRITICAL)
+.env
+
+# Ignore build artifacts and compilation folders
+target/
+**/target/
+build/
+
+# Ignore frontend dependencies
+node_modules/
+**/node_modules/
+
+# Ignore local IDE settings
+.idea/
+.vscode/
+*.iml
